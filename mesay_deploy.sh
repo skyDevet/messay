@@ -33,18 +33,17 @@ END
 cat > vite.config.js << 'END'
 import { defineConfig } from 'vite';
 import preact from '@preact/preset-vite';
-export default defineConfig(
-  
-  { plugins: [preact()], 
-    server: 
-          { 
-     host: '0.0.0.0',
-     port: 5173
-                              
-             }
-                            
-        });
-END
+
+export default defineConfig({
+  plugins: [preact()],
+  server: {
+    host: '0.0.0.0',
+    port: 5173,
+    proxy: {
+      '/api': { target: 'http://localhost:3001', changeOrigin: true },
+    },
+  },
+});END
 cat > server.js << 'END'
 END
 cat > index.html << 'END'
@@ -125,6 +124,8 @@ import { Admin } from './admin/Admin.jsx';
 import { getRateBookMeta, seedFromModule } from './data/ratebook.js';
 import { LoginModal } from './components/LoginModal.jsx';
 import { useAuth } from './lib/auth.js';
+import { supabase } from './lib/supabase.js';
+import { isAdminUser } from './lib/auth.js';
 
 export function App() {
   const [activeProject, setActiveProject] = useState(null);
@@ -160,19 +161,24 @@ export function App() {
   useEffect(() => {
     if (sessionStorage.getItem('mesay_admin_oauth') === '1') setLoginOpen(true);
   }, []);
-
-  useEffect(() => {
-    (async () => {
-      try {
-        const meta = await getRateBookMeta();
-        if (!meta) {
-          const res = await seedFromModule();
-          console.log('Rate book auto-seeded:', res);
-        }
-      } catch (e) { console.error('Auto-seed failed:', e); }
-    })();
-  }, []);
-
+  
+useEffect(() => {
+  (async () => {
+    try {
+      const { migrateRateBook } = await import('./data/ratebook.js');
+      const mig = await migrateRateBook();
+      if (mig.itemsFixed || mig.categoriesFixed) {
+        console.log('Rate book migration:', mig);
+      }
+      const meta = await getRateBookMeta();
+      if (!meta) {
+        const res = await seedFromModule();
+        console.log('Rate book auto-seeded:', res);
+      }
+    } catch (e) { console.error('Auto-seed failed:', e); }
+  })();
+}, []);
+  
   // When the user picks a form, scroll to it once it renders
   useEffect(() => {
     if (openForm) {
@@ -198,10 +204,22 @@ export function App() {
       <RequestServices user={user} onClose={() => setOpenForm(null)} />
     </div>
   );
-
+const handleStaffClick = async () => {
+  try {
+    if (!supabase) { setLoginOpen(true); return; }
+    const { data: s } = await supabase.auth.getSession();
+    const u = s.session && s.session.user;
+    if (u && (await isAdminUser(u.id))) {
+      sessionStorage.setItem('mesay_staff', '1');
+      setStaff(true);
+      return;
+    }
+  } catch (e) {}
+  setLoginOpen(true);
+};
   return (
     <>
-      <Nav onStaff={() => setLoginOpen(true)} onRequestQuote={() => requestForm('materials')} />
+      <Nav onStaff={handleStaffClick} onRequestQuote={() => requestForm('materials')} />
       <Hero onOpenForm={requestForm} />
       <TrustStats />
       <Services />
@@ -1232,26 +1250,59 @@ import { useStore } from '../data/store.js';
 import { getRateCategories, getRateItems } from '../data/ratebook.js';
 import { saveProforma, getProformas } from '../data/proformas.js';
 import { calcLineFromRate, calcProforma, nextProformaNumber, addDays, formatMoney } from '../data/pricing.js';
+import { egpAddItems } from '../data/egp.js';
 
 const EMPTY_CLIENT = { name: '', phone: '', email: '', company: '', projectName: '', siteAddress: '', zone: 'addis' };
 const STEP_LABELS = ['Client', 'Items', 'Proforma'];
 
-// Recompute a line after the qty or rate changes
 const redo = (l, qty, price) => calcLineFromRate(
-  { id: l.sku, description: l.name, unit: l.unit, code: l.code, basePrice: l.basePrice, contractorPrice: l.contractorPrice },
+  { id: l.sku, description: l.name, unit: l.unit, code: l.code || '', basePrice: l.basePrice, contractorPrice: l.contractorPrice },
   qty, price
 );
 
-// mode: 'from-request' (client auto-filled from a quote request) | 'internal' (empty client form)
 export function ProformaBuilder({ mode, request, onClose, onSaved }) {
   const [data] = useStore();
   const b = data.business;
   const fromRequest = mode === 'from-request';
+  const fromTender = mode === 'from-tender';
 
   const [step, setStep] = useState(1);
   const [editing, setEditing] = useState(!fromRequest);
-  const [client, setClient] = useState(() => Object.assign({}, EMPTY_CLIENT, fromRequest && request ? request.client : {}));
-  const [lines, setLines] = useState([]);
+  const [client, setClient] = useState(() => {
+    if (fromRequest && request) return Object.assign({}, EMPTY_CLIENT, request.client);
+    if (fromTender && request) {
+      const li = request.detail || {};
+      const addr = li.address || {};
+      return Object.assign({}, EMPTY_CLIENT, {
+        name: li.procuring_entity || request.tender?.procuringEntity || '',
+        company: li.procuring_entity || '',
+        email: addr.email || '',
+        phone: [addr.telephone?.code, addr.telephone?.number].filter(Boolean).join(' '),
+        projectName: li.name || request.tender?.lotName || '',
+        siteAddress: [addr.town, addr.street].filter(Boolean).join(', '),
+      });
+    }
+    return Object.assign({}, EMPTY_CLIENT);
+  });
+  const [lines, setLines] = useState(() => {
+    if (fromTender && request && Array.isArray(request.items)) {
+      return request.items.map((it, i) => ({
+        sku: it.lotItemId || ('tender_' + i),
+        name: it.description,
+        code: '',
+        unit: it.unit,
+        qty: it.qty,
+        basePrice: 0,
+        contractorPrice: it.rate || 0,
+        lineTotal: (it.rate || 0) * it.qty,
+        margin: 0,
+        taxable: true,
+        leadTimeDays: 0,
+        source: 'tender',
+      }));
+    }
+    return [];
+  });
   const [cats, setCats] = useState([]);
   const [items, setItems] = useState([]);
   const [search, setSearch] = useState('');
@@ -1267,6 +1318,7 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  const [pushMsg, setPushMsg] = useState('');
 
   useEffect(() => {
     (async () => {
@@ -1317,7 +1369,11 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
     validUntil: addDays(today, days),
     status: 'draft',
     mode,
-    sourceRequestId: request ? request.id : null,
+    sourceRequestId: request && request.id ? request.id : null,
+    sourceTenderId: fromTender && request?.tender ? request.tender.id : null,
+    quotationRequestId: fromTender && request
+      ? (request.detail?.quotationRequestId || request.detail?.quatationRequestId || request.tender?.id || null)
+      : null,
     client,
     lines,
     freightZone: client.zone,
@@ -1347,7 +1403,7 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
     <div class="pf-builder pf-wizard">
       <div class="no-print">
         <div class="admin-panel-head">
-          <h2>{fromRequest ? 'Proforma from request' : 'Internal proforma'}</h2>
+          <h2>{fromRequest ? 'Proforma from request' : (fromTender ? 'Proforma from tender' : 'Internal proforma')}</h2>
           <button class="btn btn-back" onClick={onClose}>{saved ? 'Done' : 'Cancel'}</button>
         </div>
         <div class="pf-steps">
@@ -1362,10 +1418,11 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
           <div class="admin-panel-head">
             <h3>Client details</h3>
             {fromRequest && (
-              <button type="button" class="btn btn-back" onClick={() => setEditing(!editing)}>{editing ? 'Lock details' : 'âœŽ Edit details'}</button>
+              <button type="button" class="btn btn-back" onClick={() => setEditing(!editing)}>{editing ? 'Lock details' : 'Edit details'}</button>
             )}
           </div>
           {fromRequest && !request && <div class="admin-msg">No request attached.</div>}
+          {fromTender && !request && <div class="admin-msg">No tender attached.</div>}
           <div class="pf-grid">
             <label>Full name *<input class={lockCls} readOnly={locked} value={client.name} onInput={e => setC('name', e.target.value)} /></label>
             <label>Phone<input class={lockCls} readOnly={locked} value={client.phone} onInput={e => setC('phone', e.target.value)} /></label>
@@ -1380,38 +1437,42 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
             </label>
           </div>
           <div class="pf-actions">
-            <button class="btn btn-primary" disabled={!canNext1} onClick={() => setStep(2)}>Next: Items â†’</button>
+            <button class="btn btn-primary" disabled={!canNext1} onClick={() => setStep(2)}>Next: Items</button>
           </div>
         </div>
       )}
 
       {step === 2 && (
         <div>
-          <h3>Pick items from the rate book</h3>
-          <div class="pf-pick-filters">
-            <input placeholder="Search code or description" value={search} onInput={e => setSearch(e.target.value)} />
-            <select value={cat} onChange={e => setCat(e.target.value)}>
-              <option value="all">All categories</option>
-              {cats.map(c => <option value={c.id}>{c.id}. {c.title}</option>)}
-            </select>
-          </div>
-          {items.length === 0 ? (
-            <p style="color:var(--gray);font-size:0.9rem;">The rate book is empty. Import it from the Rate Book tab first.</p>
-          ) : (
-            <div class="pf-pick-list">
-              {results.slice(0, 60).map(i => (
-                <div class="pf-pick-row" key={i.id}>
-                  <span class="rb-code">{i.code}</span>
-                  <span class="rb-desc">{i.description}</span>
-                  <span class="rb-unit">{i.unit}</span>
-                  <span class="rb-price">{i.contractorPrice == null ? 'â€”' : formatMoney(i.contractorPrice)}</span>
-                  <button type="button" class="btn-add" onClick={() => addLine(i)}>+ Add</button>
+          {!fromTender && (
+            <>
+              <h3>Pick items from the rate book</h3>
+              <div class="pf-pick-filters">
+                <input placeholder="Search code or description" value={search} onInput={e => setSearch(e.target.value)} />
+                <select value={cat} onChange={e => setCat(e.target.value)}>
+                  <option value="all">All categories</option>
+                  {cats.map(c => <option value={c.id}>{c.id}. {c.title}</option>)}
+                </select>
+              </div>
+              {items.length === 0 ? (
+                <p style="color:var(--gray);font-size:0.9rem;">The rate book is empty. Import it from the Rate Book tab first.</p>
+              ) : (
+                <div class="pf-pick-list">
+                  {results.slice(0, 60).map(i => (
+                    <div class="pf-pick-row" key={i.id}>
+                      <span class="rb-code">{i.code}</span>
+                      <span class="rb-desc">{i.description}</span>
+                      <span class="rb-unit">{i.unit}</span>
+                      <span class="rb-price">{i.contractorPrice == null ? '-' : formatMoney(i.contractorPrice)}</span>
+                      <button type="button" class="btn-add" onClick={() => addLine(i)}>+ Add</button>
+                    </div>
+                  ))}
+                  {results.length === 0 && <div class="pf-pick-row">No matching items.</div>}
                 </div>
-              ))}
-              {results.length === 0 && <div class="pf-pick-row">No matching items.</div>}
-            </div>
+              )}
+              {results.length > 60 && <p style="font-size:0.78rem;color:var(--gray);">Showing the first 60 of {results.length} matches.</p>}
+            </>
           )}
-          {results.length > 60 && <p style="font-size:0.78rem;color:var(--gray);">Showing the first 60 of {results.length} matches. Refine the search to narrow down.</p>}
 
           <h3>Selected items ({lines.length})</h3>
           {lines.length === 0 ? <p style="color:var(--gray);font-size:0.9rem;">No items yet.</p> : (
@@ -1426,15 +1487,15 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
                     <td><input type="number" min="0" step="any" value={l.qty} onInput={e => setQty(l.sku, e.target.value)} /></td>
                     <td><input type="number" min="0" step="any" value={l.contractorPrice} onInput={e => setRate(l.sku, e.target.value)} /></td>
                     <td>{formatMoney(l.lineTotal)}</td>
-                    <td><button type="button" class="btn-del" onClick={() => removeLine(l.sku)}>âœ•</button></td>
+                    <td><button type="button" class="btn-del" onClick={() => removeLine(l.sku)}>X</button></td>
                   </tr>
                 ))}
               </tbody>
             </table>
           )}
           <div class="pf-actions">
-            <button class="btn btn-back" onClick={() => setStep(1)}>â† Back</button>
-            <button class="btn btn-primary" disabled={!canNext2} onClick={() => setStep(3)}>Next: Proforma â†’</button>
+            <button class="btn btn-back" onClick={() => setStep(1)}>Back</button>
+            <button class="btn btn-primary" disabled={!canNext2} onClick={() => setStep(3)}>Next: Proforma</button>
           </div>
         </div>
       )}
@@ -1460,11 +1521,26 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
           <ProformaDoc pf={pf} />
 
           {err && <div class="staff-err">{err}</div>}
+          {pushMsg && <div class="admin-msg">{pushMsg}</div>}
           <div class="pf-actions no-print">
-            {!saved && <button class="btn btn-back" onClick={() => setStep(2)}>â† Back</button>}
+            {!saved && <button class="btn btn-back" onClick={() => setStep(2)}>Back</button>}
             {!saved && <button class="btn btn-primary" disabled={busy || !number} onClick={save}>{busy ? 'Saving...' : 'Save Proforma'}</button>}
             {saved && <div class="admin-msg" style="flex:1;margin:0;">Saved as {number}</div>}
             {saved && <button class="btn btn-back" onClick={() => window.print()}>Print</button>}
+            {saved && fromTender && request?.tender?.sourceApplication === 'Purchasing' && (
+              <button class="btn-add" onClick={async () => {
+                setPushMsg('');
+                const qrid = request.detail?.quotationRequestId || request.detail?.quatationRequestId || request.tender.id;
+                const resp = await fetch(`/api/egp/tender/${qrid}/response`).then(r => r.json()).catch(() => null);
+                if (!resp?.id) { setPushMsg('Register on eGP first (Tenders tab).'); return; }
+                const itemsToPush = lines.filter(l => l.contractorPrice > 0).map(l => ({
+                  lotItemId: l.sku, name: l.name, description: l.name,
+                  quantity: l.qty, unitMeasure: l.unit,
+                }));
+                const r = await egpAddItems(resp.id, itemsToPush);
+                setPushMsg(r.ok ? `Pushed ${itemsToPush.length} items to eGP.` : 'Push failed: ' + JSON.stringify(r.data));
+              }}>Push prices to eGP</button>
+            )}
             {saved && <button class="btn btn-primary" onClick={onClose}>Done</button>}
           </div>
         </div>
@@ -1473,7 +1549,6 @@ export function ProformaBuilder({ mode, request, onClose, onSaved }) {
   );
 }
 
-// The printable proforma document (also used to view saved proformas)
 export function ProformaDoc({ pf }) {
   const [data] = useStore();
   const b = data.business;
@@ -1488,8 +1563,8 @@ export function ProformaDoc({ pf }) {
         <div>
           <h1>{b.nameEn}</h1>
           <p>{b.addressEn}</p>
-          <p>{b.cell1} Â· {b.cell2} Â· {b.email}</p>
-          <p>TIN {b.tin} Â· License {b.businessLicenseNo}</p>
+          <p>{b.cell1} · {b.cell2} · {b.email}</p>
+          <p>TIN {b.tin} · License {b.businessLicenseNo}</p>
         </div>
         <div class="pf-doc-meta">
           <h2>PROFORMA</h2>
@@ -1531,7 +1606,7 @@ export function ProformaDoc({ pf }) {
         <div><span>Subtotal</span><span>{formatMoney(t.subtotal)}</span></div>
         {t.markup > 0 && <div><span>Markup ({pf.markupPct}%)</span><span>{formatMoney(t.markup)}</span></div>}
         {t.contingency > 0 && <div><span>Contingency ({pf.contingencyPct}%)</span><span>{formatMoney(t.contingency)}</span></div>}
-        {t.discount > 0 && <div><span>Discount ({pf.discountPct}%)</span><span>âˆ’ {formatMoney(t.discount)}</span></div>}
+        {t.discount > 0 && <div><span>Discount ({pf.discountPct}%)</span><span>- {formatMoney(t.discount)}</span></div>}
         <div><span>Freight</span><span>{formatMoney(t.freight)}</span></div>
         <div><span>VAT ({Math.round((pf.vatRate || 0) * 100)}%)</span><span>{formatMoney(t.vat)}</span></div>
         <div class="pf-grand"><span>Grand Total</span><span>{formatMoney(t.grandTotal)}</span></div>
@@ -1549,8 +1624,7 @@ export function ProformaDoc({ pf }) {
       </div>
     </div>
   );
-}
-END
+}END
 cat > src/components/ProjectModal.jsx << 'END'
 export function ProjectModal({ project, onClose, onRequest }) {
   if (!project) return null;
@@ -1966,9 +2040,39 @@ export function TrustStats() {
   );
 }
 END
+cat > src/data/business.js << 'END'
+import { put, get, del, getAll } from './db.js';
+
+// --- Business Info ---
+export async function saveBusinessInfo(data) {
+  return put('business_info', { key: 'business', data });
+}
+
+export async function getBusinessInfo() {
+  const row = await get('business_info', 'business');
+  return row ? row.data : null;
+}
+
+// --- Documents ---
+export async function saveBusinessDoc(type, file) {
+  if (!file) throw new Error('No file provided');
+  return put('business_docs', { type, file, name: file.name, updatedAt: Date.now() });
+}
+
+export async function getBusinessDoc(type) {
+  return get('business_docs', type);
+}
+
+export async function deleteBusinessDoc(type) {
+  return del('business_docs', type);
+}
+
+export async function getAllBusinessDocs() {
+  return getAll('business_docs');
+}END
 cat > src/data/db.js << 'END'
 const DB_NAME = 'mesay_db';
-const DB_VERSION = 2;
+const DB_VERSION = 5;
 let _db = null;
 
 export function openDB() {
@@ -2002,9 +2106,25 @@ export function openDB() {
       if (!db.objectStoreNames.contains('meta'))
         db.createObjectStore('meta', { keyPath: 'key' });
 
-      // NEW: blobs for product images
       if (!db.objectStoreNames.contains('product_images'))
         db.createObjectStore('product_images', { keyPath: 'id' });
+
+      if (!db.objectStoreNames.contains('egp_tenders')) {
+        const s = db.createObjectStore('egp_tenders', { keyPath: 'id' });
+        s.createIndex('by-deadline', 'submissionDeadline');
+        s.createIndex('by-entity', 'procuringEntity');
+        s.createIndex('by-fetched', 'fetchedAt');
+      }
+      if (!db.objectStoreNames.contains('egp_tender_details'))
+        db.createObjectStore('egp_tender_details', { keyPath: 'lotId' });
+      if (!db.objectStoreNames.contains('egp_tender_items'))
+        db.createObjectStore('egp_tender_items', { keyPath: 'key' });
+
+      // NEW: Business Info & Docs
+      if (!db.objectStoreNames.contains('business_info'))
+        db.createObjectStore('business_info', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('business_docs'))
+        db.createObjectStore('business_docs', { keyPath: 'type' });
     };
     req.onsuccess = () => { _db = req.result; resolve(_db); };
     req.onerror = () => reject(req.error);
@@ -2053,6 +2173,612 @@ export function clearStore(store) {
   return tx(store, 'readwrite').then(s => new Promise((res, rej) => {
     const r = s.clear(); r.onsuccess = () => res(); r.onerror = () => rej(r.error);
   }));
+}END
+cat > src/data/egp.js << 'END'
+export async function egpStatus()  { return (await fetch('/api/egp/status')).json(); }
+export async function egpLogin()   { return (await fetch('/api/egp/login', { method:'POST' })).json(); }
+
+export async function fetchTenders({ search='Construction', top=15, skip=0, locale='en' } = {}) {
+  const p = new URLSearchParams();
+  p.set('type','all'); p.set('skip',skip); p.set('top',top);
+  p.set('locale',locale); p.set('search',search);
+  ['lotName','sourceApplication','lotReferenceNo','procurementReferenceNo']
+    .forEach((f,i)=>p.set(`searchFrom[${i}]`, f));
+  p.set('orderBy[0].field','invitationDate');
+  p.set('orderBy[0].direction','desc');
+  const r = await fetch('/api/egp/tenders?' + p.toString());
+  if (!r.ok) throw new Error('eGP HTTP ' + r.status);
+  return r.json();
+}
+
+export async function fetchTenderDetail(tender) {
+  const q = tender.sourceApplication === 'Purchasing' ? '?source=purchasing' : '';
+  const r = await fetch(`/api/egp/tender/${tender.sourceId || tender.id}${q}`);
+  if (!r.ok) throw new Error('eGP HTTP ' + r.status);
+  return r.json();
+}
+
+export async function fetchQuotationItems(quotationRequestId) {
+  const r = await fetch(`/api/egp/tender/${quotationRequestId}/items`);
+  if (!r.ok) throw new Error('eGP HTTP ' + r.status);
+  return r.json();
+}
+
+export async function fetchResponseItems(responseId) {
+  const r = await fetch(`/api/egp/tender/${responseId}/response-items`);
+  if (!r.ok) throw new Error('eGP HTTP ' + r.status);
+  return r.json();
+}
+
+export async function fetchSchedule(lotItemId) {
+  const r = await fetch(`/api/egp/schedule/${lotItemId}`);
+  if (!r.ok) throw new Error('eGP HTTP ' + r.status);
+  return r.json();
+}
+
+export async function fetchQuotationResponse(quotationRequestId) {
+  const r = await fetch(`/api/egp/tender/${quotationRequestId}/response`);
+  if (!r.ok) return null;
+  return r.json();
+}
+
+export async function egpRegister(quotationRequestId, quotationRequestName) {
+  const r = await fetch('/api/egp/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ quotationRequestId, quotationRequestName }),
+  });
+  return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+export async function egpPushPriceOne(payload) {
+  const r = await fetch('/api/egp/push-price-one', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+export async function egpPushSpecOne(payload) {
+  const r = await fetch('/api/egp/push-spec-one', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+// Kept for compatibility, hits the deprecated route
+export async function egpAddItems(quotationRequestResponseId, items) {
+  const r = await fetch('/api/egp/add-items', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ quotationRequestResponseId, items }),
+  });
+  return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+export async function egpSubmit(responseId) {
+  const r = await fetch(`/api/egp/submit/${responseId}`, { method: 'POST' });
+  return { ok: r.ok, status: r.status, data: await r.json().catch(() => ({})) };
+}
+
+export function normalizeTenderList(payload) {
+  const out = [];
+  for (const pkg of payload.items || []) {
+    for (const lot of pkg.result || []) {
+      const pi = lot.packageInformation || {};
+      out.push({
+        id: lot.id,
+        sourceId: lot.sourceId || null,
+        lotName: lot.lotName || pi.packageName || '',
+        lotDescription: (lot.lotDescription || pi.packageDescription || '').trim(),
+        lotReferenceNo: lot.lotReferenceNo || '',
+        procurementReferenceNo: lot.procurementReferenceNo || '',
+        procurementCategory: lot.procurementCategory || '',
+        procuringEntity: pi.procuringEntity?.en || lot.procuringEntity || '',
+        procuringEntityAm: pi.procuringEntity?.am || '',
+        sourceApplication: lot.sourceApplication || '',
+        marketPlace: lot.marketPlace || '',
+        method: lot.method || '',
+        submissionDeadline: lot.submissionDeadline || null,
+        openingSchedule: lot.openingSchedule || null,
+        invitationDate: lot.invitationDate || null,
+        address: pi.address || {},
+        classification: (lot.procurementClassification || [])
+          .map(c => c.title?.en).filter(Boolean),
+        origin: lot.origin || '',
+        originName: lot.originName?.en || '',
+        fetchedAt: Date.now(),
+      });
+    }
+  }
+  const seen = new Set();
+  return out.filter(t => seen.has(t.id) ? false : (seen.add(t.id), true));
+}
+
+// Preserves both tender-level and response-level shapes.
+export function normalizeItems(payload) {
+  const arr = Array.isArray(payload) ? payload : (payload.items || []);
+  return arr.map(it => {
+    const rawId = it.id;
+    const responseItemId = rawId && rawId !== '00000000-0000-0000-0000-000000000000' ? rawId : null;
+    return {
+      responseItemId,
+      lotItemId: it.lotItemId || (responseItemId ? null : rawId) || null,
+      name: it.name || '',
+      description: (it.description || '').trim().replace(/\s+/g, ' '),
+      unit: it.unitOfMeasure || it.unitMeasure || it.unit || '',
+      qty: Number(it.revisedQuantity ?? it.originalQuantity ?? it.quantity ?? it.qty ?? 0),
+      rate: Number(it.unitPrice) || 0,
+    };
+  });
+}END
+cat > src/data/goods-data.js << 'END'
+export const GOODS = { 
+  "source": "Table",
+  "extractedAt": "2026-10-21T23:03:02.504Z",
+  "pageCount": 13,
+  "categories": [
+    {
+      "category": "ENERGY",
+      "categoryAm": "ኃይል",
+      "items": [
+        {"no": 1, "item": "Benzene(Regular)- Gasoline *", "itemAm": "ቤንዚን (መደበኛ) - ነዳጅ *", "unit": "Lit.", "march2026": "142.41", "june2026": "167.50", "change": "+18%"},
+        {"no": 2, "item": "Diesel *", "itemAm": "ናፍጣ *", "unit": "Lit.", "march2026": "163.09", "june2026": "180.46", "change": "+11%"}
+      ]
+    },
+    {
+      "category": "CEMENT, AGGREGATES & CONCRETE",
+      "categoryAm": "ሲሚንቶ፣ ድምር እና ኮንክሪት",
+      "items": [
+        {"no": 3, "item": "Sika Ceram 105", "itemAm": "ሲካ ሴራም 105", "unit": "Kg", "march2026": "26.22", "june2026": "65.54", "change": "+150%"},
+        {"no": 4, "item": "Eucalyptus Dia 6cm", "itemAm": "የባህር ዛፍ ዲያሜትር 6ሴንቲ ሜትር", "unit": "Pcs", "march2026": "96.13", "june2026": "174.78", "change": "+82%"},
+        {"no": 5, "item": "Sika Seal-105", "itemAm": "ሲካ ሲል-105", "unit": "lit", "march2026": "174.78", "june2026": "284.02", "change": "+63%"},
+        {"no": 6, "item": "C-50 OPC RMC", "itemAm": "C-50 OPC ዝግጁ ድብልቅ ኮንክሪት", "unit": "m3", "march2026": "15,175.50", "june2026": "23,145.59", "change": "+53%"},
+        {"no": 7, "item": "C-40 OPC RMC", "itemAm": "C-40 OPC ዝግጁ ድብልቅ ኮንክሪት", "unit": "m3", "march2026": "13,969.50", "june2026": "21,306.00", "change": "+53%"},
+        {"no": 8, "item": "Sika Latex for Bonding", "itemAm": "ሲካ ላቴክስ ለማጣበቅ", "unit": "lit", "march2026": "764.67", "june2026": "1,136.09", "change": "+49%"},
+        {"no": 9, "item": "C-35 OPC RMC", "itemAm": "C-35 OPC ዝግጁ ድብልቅ ኮንክሪት", "unit": "m3", "march2026": "13,366.50", "june2026": "19,795.00", "change": "+48%"},
+        {"no": 10, "item": "C-20 OPC RMC", "itemAm": "C-20 OPC ዝግጁ ድብልቅ ኮንክሪት", "unit": "m3", "march2026": "11,186.09", "june2026": "16,556.28", "change": "+48%"},
+        {"no": 11, "item": "Derba", "itemAm": "ደርባ", "unit": "Qts", "march2026": "1,747.83", "june2026": "2,010.00", "change": "+15%"},
+        {"no": 12, "item": "National", "itemAm": "ናሽናል", "unit": "Qts", "march2026": "1,835.22", "june2026": "2,010.00", "change": "+10%"},
+        {"no": 13, "item": "Gravel 03", "itemAm": "ጠጠር 03", "unit": "m3", "march2026": "3,517.50", "june2026": "5,068.70", "change": "+44%"},
+        {"no": 14, "item": "Gravel 00", "itemAm": "ጠጠር 00", "unit": "m3", "march2026": "3,819.00", "june2026": "5,505.65", "change": "+44%"},
+        {"no": 15, "item": "C-25 OPC RMC", "itemAm": "C-25 OPC ዝግጁ ድብልቅ ኮንክሪት", "unit": "m3", "march2026": "12,562.50", "june2026": "18,592.50", "change": "+48%"},
+        {"no": 16, "item": "Redash", "itemAm": "ቀይ አመድ (ሬዳሽ)", "unit": "m3", "march2026": "419.48", "june2026": "436.96", "change": "+4%"},
+        {"no": 17, "item": "Stone Trachethic", "itemAm": "የትራኪቲክ ድንጋይ", "unit": "m3", "march2026": "1,747.83", "june2026": "2,184.78", "change": "+25%"},
+        {"no": 18, "item": "Eucalyptus Dia 18cm", "itemAm": "የባህር ዛፍ ዲያሜትር 18ሴንቲ ሜትር", "unit": "Pcs", "march2026": "367.04", "june2026": "436.96", "change": "+19%"}
+      ]
+    },
+    {
+      "category": "BLOCKS & BRICKS",
+      "categoryAm": "ብሎኮች እና ጡቦች",
+      "items": [
+        {"no": 19, "item": "Gypsum board Partion / Ceiling work with 60cmx60cm, 4×5 wooden Batton (thickness of Board -9mm)", "itemAm": "የጂፕሰም ቦርድ ክፍልፋይ / ጣሪያ ሥራ ከ60ሴንቲ ሜትርx60ሴንቲ ሜትር፣ 4×5 የእንጨት ባትን ጋር (የቦርዱ ውፍረት -9ሚሜ)", "unit": "M2", "march2026": "436.96", "june2026": "1,704.13", "change": "+290%"},
+        {"no": 20, "item": "10cm thick Class-B HCB", "itemAm": "10ሴንቲ ሜትር ውፍረት ያለው ክላስ-B HCB", "unit": "PCS", "march2026": "71.66", "june2026": "131.09", "change": "+83%"},
+        {"no": 21, "item": "15cm thick Class-B HCB", "itemAm": "15ሴንቲ ሜትር ውፍረት ያለው ክላስ-B HCB", "unit": "PCS", "march2026": "100.50", "june2026": "139.83", "change": "+39%"},
+        {"no": 22, "item": "10cm thick Class-A HCB", "itemAm": "10ሴንቲ ሜትር ውፍረት ያለው ክላስ-A HCB", "unit": "PCS", "march2026": "100.50", "june2026": "139.83", "change": "+39%"},
+        {"no": 23, "item": "10cm thick Class-C HCB", "itemAm": "10ሴንቲ ሜትር ውፍረት ያለው ክላስ-C HCB", "unit": "PCS", "march2026": "51.60", "june2026": "69.91", "change": "+35%"},
+        {"no": 24, "item": "15cm thick Class-A HCB", "itemAm": "15ሴንቲ ሜትር ውፍረት ያለው ክላስ-A HCB", "unit": "PCS", "march2026": "115.36", "june2026": "157.30", "change": "+36%"},
+        {"no": 25, "item": "Engineered Brick (<100,000 pcs)", "itemAm": "ኢንጂነርድ ጡብ (<100,000 pcs)", "unit": "PCS", "march2026": "24.47", "june2026": "23.60", "change": "-4%"},
+        {"no": 26, "item": "Magnesium Board Thickness – 6mm (2.4 m × 1.2 m)", "itemAm": "የማግኒዚየም ቦርድ ውፍረት – 6ሚሜ (2.4 ሜ × 1.2 ሜ)", "unit": "PCS", "march2026": "2,184.78", "june2026": "2,796.52", "change": "+28%"},
+        {"no": 27, "item": "Soil hydraform (9.5kg) Size 220x220x115mm", "itemAm": "ሶይል ሃይድራፎርም (9.5ኪግ) መጠን 220x220x115ሚሜ", "unit": "Pcs", "march2026": "61.17", "june2026": "69.91", "change": "+14%"}
+      ]
+    },
+    {
+      "category": "REINFORCEMENT BAR",
+      "categoryAm": "የማጠናከሪያ ብረት",
+      "items": [
+        {"no": 28, "item": "2.5 mm black wire", "itemAm": "2.5 ሚሜ ጥቁር ሽቦ", "unit": "kg", "march2026": "218.48", "june2026": "271.35", "change": "+24%"},
+        {"no": 29, "item": "1.5 mm black wire", "itemAm": "1.5 ሚሜ ጥቁር ሽቦ", "unit": "kg", "march2026": "218.48", "june2026": "241.20", "change": "+10%"},
+        {"no": 30, "item": "Dia 6 (0.222kg/m)", "itemAm": "ዲያሜትር 6 (0.222ኪግ/ሜ)", "unit": "kg", "march2026": "205.37", "june2026": "218.48", "change": "+6%"},
+        {"no": 31, "item": "Dia 8 (0.395kg/m)", "itemAm": "ዲያሜትር 8 (0.395ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"},
+        {"no": 32, "item": "Dia 10 (0.617kg/m)", "itemAm": "ዲያሜትር 10 (0.617ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"},
+        {"no": 33, "item": "Dia 12 (0.888Kg/m)", "itemAm": "ዲያሜትር 12 (0.888ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"},
+        {"no": 34, "item": "Dia 14 (1.21Kg/m)", "itemAm": "ዲያሜትር 14 (1.21ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"},
+        {"no": 35, "item": "Dia 16 (1.58kg/m)", "itemAm": "ዲያሜትር 16 (1.58ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"},
+        {"no": 36, "item": "Dia 20 (2.47kg/m)", "itemAm": "ዲያሜትር 20 (2.47ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"},
+        {"no": 37, "item": "Dia 24 (3.46kg/m)", "itemAm": "ዲያሜትር 24 (3.46ኪግ/ሜ)", "unit": "kg", "march2026": "209.74", "june2026": "209.74", "change": "0%"}
+      ]
+    },
+    {
+      "category": "BITUMEN & ASPHALT",
+      "categoryAm": "ቢቱመን እና አስፋልት",
+      "items": [
+        {"no": 38, "item": "Bitumen 180/200", "itemAm": "ቢቱመን 180/200", "unit": "lit", "march2026": "94.21", "june2026": "97.88", "change": "+4%"},
+        {"no": 39, "item": "AC-40/50", "itemAm": "AC-40/50", "unit": "lit", "march2026": "137.64", "june2026": "141.57", "change": "+3%"},
+        {"no": 40, "item": "MC-30", "itemAm": "MC-30", "unit": "lit", "march2026": "217.06", "june2026": "222.17", "change": "+2%"},
+        {"no": 41, "item": "AC-60/70", "itemAm": "AC-60/70", "unit": "lit", "march2026": "136.23", "june2026": "139.57", "change": "+2%"},
+        {"no": 42, "item": "AC-80/100", "itemAm": "AC-80/100", "unit": "lit", "march2026": "136.23", "june2026": "139.57", "change": "+2%"}
+      ]
+    },
+    {
+      "category": "STEEL SECTIONS & SHEETS",
+      "categoryAm": "የብረት ክፍሎች እና ሉሆች",
+      "items": [
+        {"no": 43, "item": "RHS120 x120 x 4mm(14.2Kg/ml)", "itemAm": "RHS 120 x 120 x 4ሚሜ (14.2ኪግ/ሜ)", "unit": "pcs", "march2026": "16,142.92", "june2026": "25,256.09", "change": "+56%"},
+        {"no": 44, "item": "L-38mm,Thickness-1.5mm(1.755Kg/ml)", "itemAm": "L-38ሚሜ፣ ውፍረት-1.5ሚሜ (1.755ኪግ/ሜ)", "unit": "pcs", "march2026": "1,658.25", "june2026": "2,315.87", "change": "+40%"},
+        {"no": 45, "item": "T-38mm,Thickness-1.5mm(2.025Kg/ml)", "itemAm": "T-38ሚሜ፣ ውፍረት-1.5ሚሜ (2.025ኪግ/ሜ)", "unit": "pcs", "march2026": "1,658.25", "june2026": "2,315.87", "change": "+40%"},
+        {"no": 46, "item": "Z-38mm,Thickness-1.5mm(2.05Kg/ml)", "itemAm": "Z-38ሚሜ፣ ውፍረት-1.5ሚሜ (2.05ኪግ/ሜ)", "unit": "pcs", "march2026": "1,658.25", "june2026": "2,315.87", "change": "+40%"},
+        {"no": 47, "item": "RHS 80x40x2 (3.56Kg/ml)", "itemAm": "RHS 80x40x2 (3.56ኪግ/ሜ)", "unit": "pcs", "march2026": "3,640.02", "june2026": "4,762.83", "change": "+31%"},
+        {"no": 48, "item": "CHS Dia 30mmx1.5 (1.05Kg/ml)", "itemAm": "CHS ዲያሜትር 30ሚሜx1.5 (1.05ኪግ/ሜ)", "unit": "pcs", "march2026": "1,136.09", "june2026": "1,398.26", "change": "+23%"},
+        {"no": 49, "item": "RHS 60x40x2 (2.93Kg/ml)", "itemAm": "RHS 60x40x2 (2.93ኪግ/ሜ)", "unit": "pcs", "march2026": "3,148.71", "june2026": "3,845.22", "change": "+22%"},
+        {"no": 50, "item": "SHS 20x20x1 (0.58kg/m)", "itemAm": "SHS 20x20x1 (0.58ኪግ/ሜ)", "unit": "pcs", "march2026": "742.83", "june2026": "786.52", "change": "+6%"},
+        {"no": 51, "item": "SHS 80x80x4 (9.22kg/m)", "itemAm": "SHS 80x80x4 (9.22ኪግ/ሜ)", "unit": "pcs", "march2026": "13,982.61", "june2026": "13,108.70", "change": "-6%"},
+        {"no": 52, "item": "RHS 30x20x0.8 (0.6Kg/ml)", "itemAm": "RHS 30x20x0.8 (0.6ኪግ/ሜ)", "unit": "pcs", "march2026": "698.43", "june2026": "786.52", "change": "+13%"},
+        {"no": 53, "item": "RHS 100x60x4mm(9.54Kg/ml)", "itemAm": "RHS 100x60x4ሚሜ (9.54ኪግ/ሜ)", "unit": "pcs", "march2026": "9,434.77", "june2026": "11,186.09", "change": "+19%"},
+        {"no": 54, "item": "RHS120 x 80x 3mm(9.1Kg/ml)", "itemAm": "RHS 120 x 80 x 3ሚሜ (9.1ኪግ/ሜ)", "unit": "pcs", "march2026": "9,426.03", "june2026": "10,609.30", "change": "+13%"},
+        {"no": 55, "item": "CHS Dia 28mmx1.5 (0.97Kg/ml)", "itemAm": "CHS ዲያሜትር 28ሚሜx1.5 (0.97ኪግ/ሜ)", "unit": "pcs", "march2026": "1,153.57", "june2026": "1,249.70", "change": "+8%"},
+        {"no": 56, "item": "CHS Dia90mmx2.0 (4.34Kg/ml)", "itemAm": "CHS ዲያሜትር 90ሚሜx2.0 (4.34ኪግ/ሜ)", "unit": "pcs", "march2026": "5,680.43", "june2026": "5,785.30", "change": "+2%"}
+      ]
+    },
+    {
+      "category": "BOLTS & FASTENERS",
+      "categoryAm": "ቦልቶች እና ማያያዣዎች",
+      "items": [
+        {"no": 57, "item": "Bolt-M16 Length =5cm", "itemAm": "ቦልት-M16 ርዝመት =5ሴንቲ ሜትር", "unit": "pcs", "march2026": "50.25", "june2026": "57.79", "change": "+15%"},
+        {"no": 58, "item": "Blot-J20 Length =50cm", "itemAm": "ቦልት-J20 ርዝመት =50ሴንቲ ሜትር", "unit": "pcs", "march2026": "244.70", "june2026": "281.40", "change": "+15%"},
+        {"no": 59, "item": "J bolt dia. 16 mm L 300mm grade 4.8", "itemAm": "J ቦልት ዲያሜትር 16 ሚሜ L 300ሚሜ ግሬድ 4.8", "unit": "Pcs", "march2026": "113.61", "june2026": "130.65", "change": "+15%"},
+        {"no": 60, "item": "Bolt-M24 Length =5cm", "itemAm": "ቦልት-M24 ርዝመት =5ሴንቲ ሜትር", "unit": "pcs", "march2026": "70.35", "june2026": "80.90", "change": "+15%"},
+        {"no": 61, "item": "Bolt-J16 Length=50cm", "itemAm": "ቦልት-J16 ርዝመት=50ሴንቲ ሜትር", "unit": "pcs", "march2026": "183.52", "june2026": "211.05", "change": "+15%"},
+        {"no": 62, "item": "J bolt dia. 16 mm L 450mm grade 4.8", "itemAm": "J ቦልት ዲያሜትር 16 ሚሜ L 450ሚሜ ግሬድ 4.8", "unit": "Pcs", "march2026": "166.04", "june2026": "190.95", "change": "+15%"}
+      ]
+    },
+    {
+      "category": "HARDWARE & FASTENERS",
+      "categoryAm": "ሃርድዌር እና ማያያዣዎች",
+      "items": [
+        {"no": 63, "item": "Screw for hinges mm", "itemAm": "የማጠፊያ ብሎን ሚሜ", "unit": "Pc", "march2026": "349.57", "june2026": "830.22", "change": "+138%"},
+        {"no": 64, "item": "Nail different size 6cm-12cm", "itemAm": "የተለያየ መጠን ምስማር 6ሴንቲ ሜትር-12ሴንቲ ሜትር", "unit": "kg", "march2026": "157.30", "june2026": "279.65", "change": "+78%"},
+        {"no": 65, "item": "Nails 3cm & 4cm.", "itemAm": "ምስማሮች 3ሴንቲ ሜትር እና 4ሴንቲ ሜትር።", "unit": "Kg", "march2026": "400.25", "june2026": "314.61", "change": "-21%"},
+        {"no": 66, "item": "Roof Nail", "itemAm": "የጣሪያ ምስማር", "unit": "kg", "march2026": "322.47", "june2026": "367.04", "change": "+14%"},
+        {"no": 67, "item": "T-hinges or Strap Hinges (Size 6)", "itemAm": "T-ማጠፊያዎች ወይም ስትራፕ ማጠፊያዎች (መጠን 6)", "unit": "Pcs", "march2026": "231.59", "june2026": "74.28", "change": "-68%"},
+        {"no": 68, "item": "Electrode ( 3.2 mm )", "itemAm": "ኤሌክትሮድ (3.2 ሚሜ)", "unit": "Pc", "march2026": "1,502.26", "june2026": "2,010.00", "change": "+34%"}
+      ]
+    },
+    {
+      "category": "ALUMINIUM",
+      "categoryAm": "አሉሚኒየም",
+      "items": [
+        {"no": 69, "item": "Hinge (Alloy)", "itemAm": "ማጠፊያ (አሎይ)", "unit": "Psc", "march2026": "119.60", "june2026": "349.57", "change": "+192%"},
+        {"no": 70, "item": "Window Handle – Small", "itemAm": "የመስኮት መያዣ – ትንሽ", "unit": "Psc", "march2026": "150.75", "june2026": "305.87", "change": "+103%"},
+        {"no": 71, "item": "Sliding Handle – Aluminum", "itemAm": "ተንሸራታች መያዣ – አሉሚኒየም", "unit": "Psc", "march2026": "150.75", "june2026": "262.17", "change": "+74%"},
+        {"no": 72, "item": "T-Cross Connector (Cast)", "itemAm": "T-ክሮስ አገናኝ (ካስት)", "unit": "Psc", "march2026": "27.14", "june2026": "39.33", "change": "+45%"},
+        {"no": 73, "item": "Equal Angle (L-Profile)", "itemAm": "እኩል አንግል (L-ፕሮፋይል)", "unit": "Bar", "march2026": "5,346.60", "june2026": "6,292.17", "change": "+18%"},
+        {"no": 74, "item": "Rectangular Hollow Section (RHS) / Box Profile", "itemAm": "አራት ማዕዘን ባዶ ክፍል (RHS) / ቦክስ ፕሮፋይል", "unit": "Bar", "march2026": "6,612.90", "june2026": "7,297.17", "change": "+10%"},
+        {"no": 75, "item": "L & Z Angle Connector", "itemAm": "L እና Z አንግል አገናኝ", "unit": "Psc", "march2026": "57.29", "june2026": "69.91", "change": "+22%"},
+        {"no": 76, "item": "Tower Bolt – Long", "itemAm": "ታወር ቦልት – ረዥም", "unit": "Psc", "march2026": "351.75", "june2026": "419.48", "change": "+19%"}
+      ]
+    },
+    {
+      "category": "PAINT & FINISHES",
+      "categoryAm": "ቀለም እና ማጠናቀቂያዎች",
+      "items": [
+        {"no": 77, "item": "Thinner (aquarage)", "itemAm": "ማቅለጫ (አኳሬጅ)", "unit": "lit", "march2026": "323.35", "june2026": "648.44", "change": "+101%"},
+        {"no": 78, "item": "Gypsum", "itemAm": "ጂፕሰም", "unit": "kg", "march2026": "25.34", "june2026": "39.33", "change": "+55%"},
+        {"no": 79, "item": "Varnish", "itemAm": "ቫርኒሽ", "unit": "lit", "march2026": "821.48", "june2026": "1,092.39", "change": "+33%"},
+        {"no": 80, "item": "Antirust primer red", "itemAm": "ዝገት መከላከያ ፕራይመር ቀይ", "unit": "lit", "march2026": "448.79", "june2026": "568.04", "change": "+27%"},
+        {"no": 81, "item": "Antirust primer grey", "itemAm": "ዝገት መከላከያ ፕራይመር ግራጫ", "unit": "lit", "march2026": "486.89", "june2026": "611.74", "change": "+26%"},
+        {"no": 82, "item": "Supper paint plastic", "itemAm": "ሱፐር ፕላስቲክ ቀለም", "unit": "lit", "march2026": "575.91", "june2026": "568.04", "change": "-1%"},
+        {"no": 83, "item": "Mica paint", "itemAm": "ሚካ ቀለም", "unit": "lit", "march2026": "530.47", "june2026": "524.35", "change": "-1%"},
+        {"no": 84, "item": "Primer", "itemAm": "ፕራይመር", "unit": "lit", "march2026": "192.26", "june2026": "201.00", "change": "+5%"},
+        {"no": 85, "item": "Animal glue", "itemAm": "የእንስሳት ሙጫ", "unit": "kg", "march2026": "830.22", "june2026": "856.43", "change": "+3%"},
+        {"no": 86, "item": "white putty (25kg)", "itemAm": "ነጭ ፑቲ (25ኪግ)", "unit": "kg", "march2026": "34.17", "june2026": "42.21", "change": "+24%"}
+      ]
+    },
+    {
+      "category": "DOORS",
+      "categoryAm": "በሮች",
+      "items": [
+        {"no": 87, "item": "Smooth MDF board made imported wooden door", "itemAm": "ለስላሳ MDF ቦርድ የተሠራ ከውጭ የመጣ የእንጨት በር", "unit": "m²", "march2026": "7,865.22", "june2026": "10,788.46", "change": "+37%"},
+        {"no": 88, "item": "Antique smooth MDF board made imported wooden door", "itemAm": "አንቲክ ለስላሳ MDF ቦርድ የተሠራ ከውጭ የመጣ የእንጨት በር", "unit": "m²", "march2026": "10,923.91", "june2026": "13,108.70", "change": "+20%"},
+        {"no": 89, "item": "Laminated Kitchen cabinet with out Granite", "itemAm": "ላሚኔትድ የወጥ ቤት ካቢኔት ግራናይት የለም", "unit": "m²", "march2026": "10,923.91", "june2026": "13,108.70", "change": "+20%"},
+        {"no": 90, "item": "1.5mm -3mm thick Lead lined Stainless Steel frame door with all work and Accessories Size:-85*260cm (IMPORTED)(0.8mm)", "itemAm": "1.5ሚሜ -3ሚሜ ውፍረት ያለው በእርሳስ የተሸፈነ ስቴንሌስ ስቲል ፍሬም በር ከሁሉም ሥራ እና መለዋወጫዎች ጋር መጠን:-85*260ሴንቲ ሜትር (ከውጭ የመጣ)(0.8ሚሜ)", "unit": "m²", "march2026": "18,094.37", "june2026": "19,226.09", "change": "+6%"},
+        {"no": 91, "item": "Steel Framed fire rate door with a rating of 2hr one opening", "itemAm": "የብረት ፍሬም የእሳት መከላከያ በር የ2ሰዓት ደረጃ አንድ መክፈቻ", "unit": "m²", "march2026": "38,917.97", "june2026": "40,462.17", "change": "+4%"},
+        {"no": 92, "item": "PVC made Kitchen cabinet with Granite", "itemAm": "PVC የተሠራ የወጥ ቤት ካቢኔት ከግራናይት ጋር", "unit": "m²", "march2026": "16,604.35", "june2026": "19,051.30", "change": "+15%"}
+      ]
+    },
+    {
+      "category": "GLASS & GLAZING",
+      "categoryAm": "ብርጭቆ እና መስታወት",
+      "items": [
+        {"no": 93, "item": "4 mm. clear glass", "itemAm": "4 ሚሜ. ግልጽ ብርጭቆ", "unit": "m2", "march2026": "2,010.00", "june2026": "2,796.52", "change": "+39%"},
+        {"no": 94, "item": "5 mm. clear glass", "itemAm": "5 ሚሜ. ግልጽ ብርጭቆ", "unit": "m2", "march2026": "2,534.35", "june2026": "3,146.09", "change": "+24%"}
+      ]
+    },
+    {
+      "category": "FORMWORK & TIMBER",
+      "categoryAm": "ፎርምወርክ እና እንጨት",
+      "items": [
+        {"no": 95, "item": "Fair Faced Formwork (High Quality Plywood)", "itemAm": "ፌር ፌስድ ፎርምወርክ (ከፍተኛ ጥራት ፕላይዉድ)", "unit": "m2", "march2026": "2,621.74", "june2026": "5,680.43", "change": "+117%"},
+        {"no": 96, "item": "Chipwood wall 8mm", "itemAm": "የቺፕዉድ ግድግዳ 8ሚሜ", "unit": "PCS", "march2026": "1,223.48", "june2026": "2,272.17", "change": "+86%"},
+        {"no": 97, "item": "Yellow plate Form work", "itemAm": "ቢጫ ሰሌዳ ፎርም ሥራ", "unit": "m2", "march2026": "2,971.30", "june2026": "4,937.61", "change": "+66%"},
+        {"no": 98, "item": "Timber 15cm x 4 m", "itemAm": "እንጨት 15ሴንቲ ሜትር x 4 ሜ", "unit": "pcs", "march2026": "1,747.83", "june2026": "2,184.78", "change": "+25%"},
+        {"no": 99, "item": "Scaffolding", "itemAm": "ስካፎልዲንግ", "unit": "No", "march2026": "13,720.43", "june2026": "14,419.57", "change": "+5%"},
+        {"no": 100, "item": "Chipwood wall 13mm", "itemAm": "የቺፕዉድ ግድግዳ 13ሚሜ", "unit": "PCS", "march2026": "2,184.78", "june2026": "2,534.35", "change": "+16%"}
+      ]
+    },
+    
+    {
+      "category": "FLOORING & TILES",
+      "categoryAm": "ወለል እና ታይሎች",
+      "items": [
+        {"no": 101, "item": "5kg Filler", "itemAm": "5ኪግ መሙያ", "unit": "bag", "march2026": "480.65", "june2026": "1,267.17", "change": "+164%"},
+        {"no": 102, "item": "1 cm thick Black Galaxy Granite, Size:-40cmx40cm-Imported", "itemAm": "1 ሴንቲ ሜትር ውፍረት ያለው ብላክ ጋላክሲ ግራናይት፣ መጠን:-40ሴንቲ ሜትርx40ሴንቲ ሜትር-ከውጭ የመጣ", "unit": "lm", "march2026": "1,223.48", "june2026": "3,076.17", "change": "+151%"},
+        {"no": 103, "item": "2kg Filler", "itemAm": "2ኪግ መሙያ", "unit": "bag", "march2026": "480.65", "june2026": "917.61", "change": "+91%"},
+        {"no": 104, "item": "Adhesive (25 kg)", "itemAm": "አጣቢ (25 ኪግ)", "unit": "Kg", "march2026": "699.13", "june2026": "1,092.39", "change": "+56%"},
+        {"no": 105, "item": "7mm ceramic floor local", "itemAm": "7ሚሜ ሴራሚክ ወለል የአገር ውስጥ", "unit": "m2", "march2026": "1,048.70", "june2026": "1,608.00", "change": "+53%"},
+        {"no": 106, "item": "2mm thick PVC flooring", "itemAm": "2ሚሜ ውፍረት ያለው PVC ወለል", "unit": "m2", "march2026": "699.13", "june2026": "1,048.70", "change": "+50%"},
+        {"no": 107, "item": "Adhesive", "itemAm": "አጣቢ", "unit": "bag", "march2026": "742.83", "june2026": "1,092.39", "change": "+47%"},
+        {"no": 108, "item": "10cm high PVC skirting 2mm thick", "itemAm": "10ሴንቲ ሜትር ከፍታ PVC ስኪርቲንግ 2ሚሜ ውፍረት", "unit": "lm", "march2026": "74.28", "june2026": "104.87", "change": "+41%"},
+        {"no": 109, "item": "Terrazzo tile flooring (Colored -Black)Thickness=3.5cm", "itemAm": "የተራዞ ታይል ወለል (ባለቀለም -ጥቁር) ውፍረት=3.5ሴንቲ ሜትር", "unit": "m2", "march2026": "436.96", "june2026": "611.74", "change": "+40%"},
+        {"no": 110, "item": "water proofing 5*10", "itemAm": "የውሃ መከላከያ 5*10", "unit": "Kg", "march2026": "5,243.48", "june2026": "4,893.91", "change": "-7%"},
+        {"no": 111, "item": "30mm thick Marbel window cill for HCB", "itemAm": "30ሚሜ ውፍረት ያለው የእርስ መስኮት ጠርዝ ለHCB", "unit": "m2", "march2026": "5,680.43", "june2026": "6,991.30", "change": "+23%"},
+        {"no": 112, "item": "Ceramic Tile flooring 9mm -Imported (Rack)", "itemAm": "የሴራሚክ ታይል ወለል 9ሚሜ -ከውጭ የመጣ (ራክ)", "unit": "m2", "march2026": "3,626.74", "june2026": "3,679.17", "change": "+1%"},
+        {"no": 113, "item": "Thickness- 6mm", "itemAm": "ውፍረት- 6ሚሜ", "unit": "m2", "march2026": "4,020.00", "june2026": "4,194.78", "change": "+4%"},
+        {"no": 114, "item": "120cm x 28cmx3cm thick Marble threads-Local", "itemAm": "120ሴንቲ ሜትር x 28ሴንቲ ሜትርx3ሴንቲ ሜትር ውፍረት ያለው የእርስ ተርድ-የአገር ውስጥ", "unit": "m", "march2026": "2,114.17", "june2026": "2,495.90", "change": "+18%"},
+        {"no": 115, "item": "120cm x 33cmx3cm thick Granite threads-Imported", "itemAm": "120ሴንቲ ሜትር x 33ሴንቲ ሜትርx3ሴንቲ ሜትር ውፍረት ያለው የግራናይት ተርድ-ከውጭ የመጣ", "unit": "pcs", "march2026": "5,364.08", "june2026": "5,710.15", "change": "+6%"},
+        {"no": 116, "item": "200cm x 16cmx2cm thick Marble Riser-Local", "itemAm": "200ሴንቲ ሜትር x 16ሴንቲ ሜትርx2ሴንቲ ሜትር ውፍረት ያለው የእርስ ራይዘር-የአገር ውስጥ", "unit": "m", "march2026": "1,985.53", "june2026": "2,321.11", "change": "+17%"},
+        {"no": 117, "item": "120cm x 14cmx2cm thick Terrazo Riser", "itemAm": "120ሴንቲ ሜትር x 14ሴንቲ ሜትርx2ሴንቲ ሜትር ውፍረት ያለው የተራዞ ራይዘር", "unit": "m", "march2026": "286.29", "june2026": "323.00", "change": "+13%"},
+        {"no": 118, "item": "20mm thick Terrazo skirting", "itemAm": "20ሚሜ ውፍረት ያለው የተራዞ ስኪርቲንግ", "unit": "lm", "march2026": "170.41", "june2026": "192.26", "change": "+13%"}
+      ]
+    },
+    {
+      "category": "CEILING",
+      "categoryAm": "ጣሪያ",
+      "items": [
+        {"no": 119, "item": "Purlin for ceiling", "itemAm": "ፐርላይን ለጣሪያ", "unit": "m2", "march2026": "1,048.70", "june2026": "2,359.57", "change": "+125%"},
+        {"no": 120, "item": "Mineral fiber acoustic ceiling With Suspender, all accessories and labour", "itemAm": "ሚኒራል ፋይበር አኮስቲክ ጣሪያ ከሰስፔንደር፣ ሁሉም መለዋወጫዎች እና ጉልበት ጋር", "unit": "m2", "march2026": "1,747.83", "june2026": "3,311.26", "change": "+89%"},
+        {"no": 121, "item": "8mm Plywood", "itemAm": "8ሚሜ ፕላይዉድ", "unit": "pcs", "march2026": "2,534.35", "june2026": "4,107.39", "change": "+62%"},
+        {"no": 122, "item": "8mm Chip wood Ceiling", "itemAm": "8ሚሜ ቺፕ ዉድ ጣሪያ", "unit": "pcs", "march2026": "1,485.65", "june2026": "2,534.35", "change": "+71%"},
+        {"no": 123, "item": "12-15 mm thick Gypsum Ceiling (water proof) with suspender&all accessories", "itemAm": "12-15 ሚሜ ውፍረት ያለው የጂፕሰም ጣሪያ (የውሃ መከላከያ) ከሰስፔንደር እና ሁሉም መለዋወጫዎች ጋር", "unit": "M2", "march2026": "3,408.26", "june2026": "3,182.14", "change": "-7%"}
+      ]
+    },
+    {
+      "category": "ROOFING",
+      "categoryAm": "የጣሪያ ሥራ",
+      "items": [
+        {"no": 124, "item": "G-30 CIS Roofing", "itemAm": "G-30 CIS የጣሪያ ሽፋን", "unit": "Pcs", "march2026": "1,293.39", "june2026": "1,597.95", "change": "+24%"},
+        {"no": 125, "item": "G-28 CIS Roofing", "itemAm": "G-28 CIS የጣሪያ ሽፋን", "unit": "Pcs", "march2026": "1,573.04", "june2026": "1,909.50", "change": "+21%"},
+        {"no": 126, "item": "Acrylic Skylight with 5mm Aluminum frame", "itemAm": "አክሬሊክ ስካይላይት ከ5ሚሜ አሉሚኒየም ፍሬም ጋር", "unit": "Pcs", "march2026": "1,048.70", "june2026": "1,223.48", "change": "+17%"},
+        {"no": 127, "item": "G-32 CIS Roofing (Without Truss & Purlin)", "itemAm": "G-32 CIS የጣሪያ ሽፋን (ትረስ እና ፐርላይን የለም)", "unit": "Pcs", "march2026": "1,179.78", "june2026": "1,306.50", "change": "+11%"},
+        {"no": 128, "item": "G-35 CIS Roofing (Without Truss & Purlin)", "itemAm": "G-35 CIS የጣሪያ ሽፋን (ትረስ እና ፐርላይን የለም)", "unit": "M2", "march2026": "742.83", "june2026": "786.52", "change": "+6%"},
+        {"no": 129, "item": "0.3mm thick (30 Gauge)", "itemAm": "0.3ሚሜ ውፍረት (30 ጌጅ)", "unit": "M2", "march2026": "1,467.30", "june2026": "1,503.65", "change": "+2%"},
+        {"no": 130, "item": "Coated EGA 400 with 0.5mm roof cover", "itemAm": "የተሸፈነ EGA 400 ከ0.5ሚሜ ጣሪያ ሽፋን ጋር", "unit": "M2", "march2026": "1,280.28", "june2026": "1,310.87", "change": "+2%"},
+        {"no": 131, "item": "G-30 of Devl Length 50cm", "itemAm": "G-30 devl ርዝመት 50ሴንቲ ሜትር", "unit": "ML", "march2026": "589.89", "june2026": "589.89", "change": "0%"},
+        {"no": 132, "item": "G-28 of Devl Length 60cm", "itemAm": "G-28 devl ርዝመት 60ሴንቲ ሜትር", "unit": "ML", "march2026": "789.14", "june2026": "789.14", "change": "0%"},
+        {"no": 133, "item": "Decra Vally Gutter (Local)", "itemAm": "ዴክራ ቫሊ ገተር (የአገር ውስጥ)", "unit": "Ml", "march2026": "611.74", "june2026": "611.74", "change": "0%"}
+      ]
+    },
+    {
+      "category": "SANITARY FITTINGS",
+      "categoryAm": "የሳኒቴሪ መለዋወጫዎች",
+      "items": [
+        {"no": 134, "item": "Turkish WC medium quality", "itemAm": "የቱርክ WC መካከለኛ ጥራት", "unit": "pcs", "march2026": "6,449.48", "june2026": "20,973.91", "change": "+225%"},
+        {"no": 135, "item": "Turkish WC high quality", "itemAm": "የቱርክ WC ከፍተኛ ጥራት", "unit": "pcs", "march2026": "7,655.48", "june2026": "24,469.57", "change": "+220%"},
+        {"no": 136, "item": "HWB size 45 * 55 cm (Golden dragon sealed)", "itemAm": "HWB መጠን 45 * 55 ሴንቲ ሜትር (ጎልደን ድራጎን ሲልድ)", "unit": "pcs", "march2026": "11,360.87", "june2026": "33,392.22", "change": "+194%"},
+        {"no": 137, "item": "HWB size 45 * 55 cm (AQUA)", "itemAm": "HWB መጠን 45 * 55 ሴንቲ ሜትር (AQUA)", "unit": "pcs", "march2026": "10,006.30", "june2026": "27,091.30", "change": "+171%"},
+        {"no": 138, "item": "HWB size 45 * 55 cm (RAK)", "itemAm": "HWB መጠን 45 * 55 ሴንቲ ሜትር (RAK)", "unit": "pcs", "march2026": "14,419.57", "june2026": "29,713.04", "change": "+106%"},
+        {"no": 139, "item": "Capacity 50 Liter Electric StorageWater Heater", "itemAm": "50 ሊትር አቅም ያለው ኤሌክትሪክ የውሃ ማሞቂያ", "unit": "pcs", "march2026": "27,091.30", "june2026": "38,452.17", "change": "+42%"},
+        {"no": 140, "item": "WC low flash (Golden dragon sealed)", "itemAm": "WC ሎው ፍላሽ (ጎልደን ድራጎን ሲልድ)", "unit": "pcs", "march2026": "30,150.00", "june2026": "35,393.48", "change": "+17%"},
+        {"no": 141, "item": "Capacity 100 Liter Electric Storage Water Heater", "itemAm": "100 ሊትር አቅም ያለው ኤሌክትሪክ የውሃ ማሞቂያ", "unit": "pcs", "march2026": "60,125.22", "june2026": "62,921.74", "change": "+5%"},
+        {"no": 142, "item": "80Lit.water heater", "itemAm": "80 ሊትር የውሃ ማሞቂያ", "unit": "pcs", "march2026": "57,853.04", "june2026": "58,552.17", "change": "+1%"},
+        {"no": 143, "item": "Paper Towel Dispenser", "itemAm": "የወረቀት ፎጣ ማውጫ", "unit": "No", "march2026": "3,058.70", "june2026": "2,796.52", "change": "-9%"}
+      ]
+    },
+    {
+      "category": "VALVES",
+      "categoryAm": "ቫልቮች",
+      "items": [
+        {"no": 144, "item": "Ø40mm PPR", "itemAm": "Ø40ሚሜ PPR", "unit": "pcs", "march2026": "1,704.13", "june2026": "3,233.48", "change": "+90%"},
+        {"no": 145, "item": "Ø65mm PPR", "itemAm": "Ø65ሚሜ PPR", "unit": "pcs", "march2026": "3,626.74", "june2026": "5,856.09", "change": "+61%"},
+        {"no": 146, "item": "Ø32mm PPR", "itemAm": "Ø32ሚሜ PPR", "unit": "pcs", "march2026": "1,354.57", "june2026": "2,097.39", "change": "+55%"},
+        {"no": 147, "item": "2 1/2″ – 1/2″", "itemAm": "2 1/2″ – 1/2″", "unit": "No", "march2026": "1,179.78", "june2026": "603.00", "change": "-49%"},
+        {"no": 148, "item": "Ø20mm chrome service Valve", "itemAm": "Ø20ሚሜ ክሮም ሰርቪስ ቫልቭ", "unit": "pcs", "march2026": "830.22", "june2026": "1,223.48", "change": "+47%"},
+        {"no": 149, "item": "Ø25mm Bronze Gate Valve", "itemAm": "Ø25ሚሜ ብሮንዝ ጌት ቫልቭ", "unit": "pcs", "march2026": "2,184.78", "june2026": "2,446.96", "change": "+12%"},
+        {"no": 150, "item": "Ø50mm Cast iron Gate Valve", "itemAm": "Ø50ሚሜ የብረት ጌት ቫልቭ", "unit": "pcs", "march2026": "9,613.04", "june2026": "11,535.65", "change": "+20%"},
+        {"no": 151, "item": "Ø110mm PPR", "itemAm": "Ø110ሚሜ PPR", "unit": "pcs", "march2026": "10,224.78", "june2026": "11,797.83", "change": "+15%"}
+      ]
+    },
+    {
+      "category": "PIPE FITTINGS",
+      "categoryAm": "የቧንቧ መገጣጠሚያዎች",
+      "items": [
+        {"no": 152, "item": "Diameter 3/4″", "itemAm": "ዲያሜትር 3/4″", "unit": "pcs", "march2026": "323.35", "june2026": "480.65", "change": "+49%"},
+        {"no": 153, "item": "3/4″", "itemAm": "3/4″", "unit": "no", "march2026": "183.52", "june2026": "253.43", "change": "+38%"},
+        {"no": 154, "item": "1 1/2″ PPR", "itemAm": "1 1/2″ PPR", "unit": "No", "march2026": "402.00", "june2026": "524.35", "change": "+30%"},
+        {"no": 155, "item": "160 – 110mm", "itemAm": "160 – 110ሚሜ", "unit": "No", "march2026": "1,817.74", "june2026": "2,272.17", "change": "+25%"},
+        {"no": 156, "item": "2 1/2″PPR", "itemAm": "2 1/2″ PPR", "unit": "no", "march2026": "1,398.26", "june2026": "1,642.96", "change": "+18%"},
+        {"no": 157, "item": "1/2″", "itemAm": "1/2″", "unit": "no", "march2026": "157.30", "june2026": "174.78", "change": "+11%"},
+        {"no": 158, "item": "50*45", "itemAm": "50*45", "unit": "No", "march2026": "288.39", "june2026": "323.35", "change": "+12%"},
+        {"no": 159, "item": "Diameter 1″", "itemAm": "ዲያሜትር 1″", "unit": "pcs", "march2026": "506.87", "june2026": "585.52", "change": "+16%"},
+        {"no": 160, "item": "Diameter 25mm PP-R Male Elbo", "itemAm": "ዲያሜትር 25ሚሜ PP-R ወንድ ክርን", "unit": "pcs", "march2026": "393.26", "june2026": "393.26", "change": "0%"}
+      ]
+    },
+    {
+      "category": "PIPES",
+      "categoryAm": "ቧንቧዎች",
+      "items": [
+        {"no": 161, "item": "PN-16 Item but 80mm diameter", "itemAm": "PN-16 80ሚሜ ዲያሜትር", "unit": "ml", "march2026": "830.22", "june2026": "1,441.96", "change": "+74%"},
+        {"no": 162, "item": "PN-16 Item but 90mm diameter", "itemAm": "PN-16 90ሚሜ ዲያሜትር", "unit": "ml", "march2026": "838.96", "june2026": "1,441.96", "change": "+72%"},
+        {"no": 163, "item": "PN-16 Item but 110mm diameter", "itemAm": "PN-16 110ሚሜ ዲያሜትር", "unit": "ml", "march2026": "1,441.96", "june2026": "2,097.39", "change": "+45%"},
+        {"no": 164, "item": "PN-16 Item but 40mm diameter", "itemAm": "PN-16 40ሚሜ ዲያሜትር", "unit": "ml", "march2026": "157.30", "june2026": "218.48", "change": "+39%"},
+        {"no": 165, "item": "Upvc Elbow :Dia.250,90 Degree- double ring", "itemAm": "UPVC ክርን ዲያሜትር 250፣ 90 ዲግሪ - ድርብ ቀለበት", "unit": "No", "march2026": "7,865.22", "june2026": "10,923.91", "change": "+39%"},
+        {"no": 166, "item": "PN-16 Checkvalve , Diameter 20mm", "itemAm": "PN-16 ቼክ ቫልቭ፣ ዲያሜትር 20ሚሜ", "unit": "No", "march2026": "786.52", "june2026": "1,048.70", "change": "+33%"},
+        {"no": 167, "item": "Dai 110mm", "itemAm": "ዲያሜትር 110ሚሜ", "unit": "No", "march2026": "1,136.09", "june2026": "1,267.17", "change": "+12%"},
+        {"no": 168, "item": "315mm HDPE PIPE", "itemAm": "315ሚሜ HDPE ቧንቧ", "unit": "ml", "march2026": "6,816.52", "june2026": "6,816.52", "change": "0%"},
+        {"no": 169, "item": "uPVC pipe PN-10 500mm. Dia. PVC Pipe", "itemAm": "uPVC ቧንቧ PN-10 500ሚሜ. ዲያሜትር PVC ቧንቧ", "unit": "pcs", "march2026": "20,973.91", "june2026": "21,410.87", "change": "+2%"},
+        {"no": 170, "item": "Upvc Elbow :Dia.200,45 Degree- double ring", "itemAm": "UPVC ክርን ዲያሜትር 200፣ 45 ዲግሪ - ድርብ ቀለበት", "unit": "No", "march2026": "6,554.35", "june2026": "4,806.52", "change": "-27%"}
+      ]
+    },
+    {
+      "category": "PUMPS & FIRE",
+      "categoryAm": "ፓምፖች እና እሳት መከላከያ",
+      "items": [
+        {"no": 171, "item": "1kg Dry Powder", "itemAm": "1ኪግ ደረቅ ዱቄት", "unit": "No", "march2026": "3,495.65", "june2026": "2,621.74", "change": "-25%"},
+        {"no": 172, "item": "6kg Dry Powde", "itemAm": "6ኪግ ደረቅ ዱቄት", "unit": "No", "march2026": "7,865.22", "june2026": "6,117.39", "change": "-22%"},
+        {"no": 173, "item": "Fiber glass water tank 500 lt", "itemAm": "ፋይበር ግላስ የውሃ ታንክ 500 lt", "unit": "No", "march2026": "12,933.91", "june2026": "13,108.70", "change": "+1%"},
+        {"no": 174, "item": "Fiber glass water tank 15000 lt", "itemAm": "ፋይበር ግላስ የውሃ ታንክ 15000 lt", "unit": "No", "march2026": "147,691.30", "june2026": "148,390.43", "change": "+0%"},
+        {"no": 175, "item": "2kg Dry Powder", "itemAm": "2ኪግ ደረቅ ዱቄት", "unit": "No", "march2026": "3,932.61", "june2026": "3,495.65", "change": "-11%"}
+      ]
+    },
+    {
+      "category": "WATER PIPES",
+      "categoryAm": "የውሃ ቧንቧዎች",
+      "items": [
+        {"no": 176, "item": "uPVC pipe PN-6 but 110 mm diameter", "itemAm": "uPVC ቧንቧ PN-6 110 ሚሜ ዲያሜትር", "unit": "ml", "march2026": "3,320.87", "june2026": "2,796.52", "change": "-16%"},
+        {"no": 177, "item": "uPVC pipe PN-6 but 75 mm diameter", "itemAm": "uPVC ቧንቧ PN-6 75 ሚሜ ዲያሜትር", "unit": "ml", "march2026": "2,010.00", "june2026": "1,704.13", "change": "-15%"},
+        {"no": 178, "item": "uPVC pipe PN-6 but 300 mm diameter", "itemAm": "uPVC ቧንቧ PN-6 300 ሚሜ ዲያሜትር", "unit": "ml", "march2026": "26,217.39", "june2026": "29,713.04", "change": "+13%"},
+        {"no": 179, "item": "uPVC pipe PN-6 but 50 mm diameter", "itemAm": "uPVC ቧንቧ PN-6 50 ሚሜ ዲያሜትር", "unit": "ml", "march2026": "1,048.70", "june2026": "1,136.09", "change": "+8%"},
+        {"no": 180, "item": "uPVC pipe PN-6 but 160 mm diameter", "itemAm": "uPVC ቧንቧ PN-6 160 ሚሜ ዲያሜትር", "unit": "ml", "march2026": "5,680.43", "june2026": "5,593.04", "change": "-2%"},
+        {"no": 181, "item": "uPVC pipe PN-6 but 200 mm diameter", "itemAm": "uPVC ቧንቧ PN-6 200 ሚሜ ዲያሜትር", "unit": "ml", "march2026": "8,302.17", "june2026": "7,690.43", "change": "-7%"}
+      ]
+    },
+    {
+      "category": "WATER PIPES & VALVES",
+      "categoryAm": "የውሃ ቧንቧዎች እና ቫልቮች",
+      "items": [
+        {"no": 182, "item": "DN80", "itemAm": "DN80", "unit": "no", "march2026": "3,932.61", "june2026": "13,108.70", "change": "+233%"},
+        {"no": 183, "item": "DN300", "itemAm": "DN300", "unit": "no", "march2026": "35,306.09", "june2026": "104,869.57", "change": "+197%"},
+        {"no": 184, "item": "DN350", "itemAm": "DN350", "unit": "No", "march2026": "41,248.70", "june2026": "117,978.26", "change": "+186%"},
+        {"no": 185, "item": "DN100", "itemAm": "DN100", "unit": "m", "march2026": "3,932.61", "june2026": "10,486.96", "change": "+167%"},
+        {"no": 186, "item": "DN400", "itemAm": "DN400", "unit": "m", "march2026": "31,023.91", "june2026": "39,326.09", "change": "+27%"},
+        {"no": 187, "item": "DN250", "itemAm": "DN250", "unit": "pcs", "march2026": "41,073.91", "june2026": "41,073.91", "change": "0%"}
+      ]
+    },
+    {
+      "category": "PUMPS & GENERATORS",
+      "categoryAm": "ፓምፖች እና ጄኔሬተሮች",
+      "items": [
+        {"no": 188, "item": "HP (kW): 10 HP (7 kW), Flow (L/s) 5", "itemAm": "HP (kW): 10 HP (7 kW)፣ ፍሰት (L/s) 5", "unit": "set", "march2026": "112,035.65", "june2026": "239,452.17", "change": "+114%"},
+        {"no": 189, "item": "capacity; Q 1L/sat Head of 70m", "itemAm": "አቅም፤ Q 1L/s በ70ሜ ራስ", "unit": "set", "march2026": "2,311,500.00", "june2026": "74,282.61", "change": "-97%"},
+        {"no": 190, "item": "HP (kW): 3 HP (2.2 kW), Flow (L/s) 20, Head 18.5", "itemAm": "HP (kW): 3 HP (2.2 kW)፣ ፍሰት (L/s) 20፣ ራስ 18.5", "unit": "set", "march2026": "24,032.61", "june2026": "43,083.91", "change": "+79%"},
+        {"no": 191, "item": "520 kW", "itemAm": "520 kW", "unit": "set", "march2026": "18,352,174", "june2026": "19,226,087", "change": "+5%"},
+        {"no": 192, "item": "80kv", "itemAm": "80kv", "unit": "set", "march2026": "3,320,869.57", "june2026": "3,320,869.57", "change": "0%"}
+      ]
+    },
+    {
+      "category": "MECHANICAL/HVAC",
+      "categoryAm": "ሜካኒካል/ኤችቪኤሲ",
+      "items": [
+        {"no": 193, "item": "Up to 350mm 0.6mm", "itemAm": "እስከ 350ሚሜ 0.6ሚሜ", "unit": "m²", "march2026": "8,389.57", "june2026": "12,562.50", "change": "+50%"},
+        {"no": 194, "item": "enclosed perforated cable tray .", "itemAm": "የተዘጋ ቀዳዳ ያለው ኬብል ትሪ።", "unit": "m", "march2026": "8,258.48", "june2026": "6,532.50", "change": "-21%"}
+      ]
+    },
+    {
+      "category": "ELECTRICAL CABLES",
+      "categoryAm": "የኤሌክትሪክ ኬብሎች",
+      "items": [
+        {"no": 195, "item": "5*6 sq.mm cable", "itemAm": "5*6 ካሬ ሚሜ ኬብል", "unit": "Mtr", "march2026": "838.96", "june2026": "1,310.87", "change": "+56%"},
+        {"no": 196, "item": "TELE 250", "itemAm": "ቴሌ 250", "unit": "Roll", "march2026": "4,325.87", "june2026": "6,466.96", "change": "+49%"},
+        {"no": 197, "item": "TELE 100", "itemAm": "ቴሌ 100", "unit": "Roll", "march2026": "1,704.13", "june2026": "2,534.35", "change": "+49%"},
+        {"no": 198, "item": "3*70 flat FLEX", "itemAm": "3*70 ጠፍጣፋ ፍሌክስ", "unit": "Mtr", "march2026": "8,214.78", "june2026": "11,186.09", "change": "+36%"},
+        {"no": 199, "item": "1.6 FLEX", "itemAm": "1.6 ፍሌክስ", "unit": "Roll", "march2026": "13,283.48", "june2026": "17,653.04", "change": "+33%"},
+        {"no": 200, "item": "3*70 FLEX", "itemAm": "3*70 ፍሌክስ", "unit": "Mtr", "march2026": "8,520.65", "june2026": "11,273.48", "change": "+32%"},
+        {"no": 201, "item": "HDMI cable ( 10 Meter)", "itemAm": "HDMI ኬብል (10 ሜትር)", "unit": "Pcs", "march2026": "1,441.96", "june2026": "1,441.96", "change": "0%"},
+        {"no": 202, "item": "Rigid Conduit 16mm", "itemAm": "ሪጅድ ቱቦ 16ሚሜ", "unit": "Mtr", "march2026": "13.98", "june2026": "13.98", "change": "0%"},
+        {"no": 203, "item": "UPVC Pipe 32mm PN-6", "itemAm": "UPVC ቧንቧ 32ሚሜ PN-6", "unit": "Mtr", "march2026": "397.63", "june2026": "397.63", "change": "0%"},
+        {"no": 204, "item": "3*50 FLEX", "itemAm": "3*50 ፍሌክስ", "unit": "Mtr", "march2026": "5,855.22", "june2026": "7,603.04", "change": "+30%"},
+        {"no": 205, "item": "3*185/95 sq.mm cable", "itemAm": "3*185/95 ካሬ ሚሜ ኬብል", "unit": "Mtr", "march2026": "24,688.04", "june2026": "31,373.48", "change": "+27%"},
+        {"no": 206, "item": "4*16 NYY", "itemAm": "4*16 NYY", "unit": "Mtr", "march2026": "2,578.04", "june2026": "3,036.85", "change": "+18%"},
+        {"no": 207, "item": "DISH", "itemAm": "ዲሽ", "unit": "Roll", "march2026": "3,932.61", "june2026": "3,932.61", "change": "0%"}
+      ]
+    },
+    {
+      "category": "ELECTRICAL CONDUIT & RODS",
+      "categoryAm": "የኤሌክትሪክ ቱቦዎች እና ዘንጎች",
+      "items": [
+        {"no": 208, "item": "Ø 13MM", "itemAm": "Ø 13ሚሜ", "unit": "M", "march2026": "91.76", "june2026": "91.76", "change": "0%"},
+        {"no": 209, "item": "Ø 16MM", "itemAm": "Ø 16ሚሜ", "unit": "M", "march2026": "124.97", "june2026": "124.97", "change": "0%"},
+        {"no": 210, "item": "Ø 19MM", "itemAm": "Ø 19ሚሜ", "unit": "M", "march2026": "150.31", "june2026": "150.31", "change": "0%"},
+        {"no": 211, "item": "Ø 20MM", "itemAm": "Ø 20ሚሜ", "unit": "M", "march2026": "103.12", "june2026": "103.12", "change": "0%"},
+        {"no": 212, "item": "GIP Ø3/4″", "itemAm": "GIP Ø3/4″", "unit": "M", "march2026": "305.87", "june2026": "305.87", "change": "0%"}
+      ]
+    },
+    {
+      "category": "ELECTRICAL BOARDS & DEVICES",
+      "categoryAm": "የኤሌክትሪክ ቦርዶች እና መሣሪያዎች",
+      "items": [
+        {"no": 213, "item": "3*2.5 sq.mm cable", "itemAm": "3*2.5 ካሬ ሚሜ ኬብል", "unit": "Mtr", "march2026": "183.52", "june2026": "419.48", "change": "+129%"},
+        {"no": 214, "item": "3*4 sq.mm cable", "itemAm": "3*4 ካሬ ሚሜ ኬብል", "unit": "Mtr", "march2026": "288.39", "june2026": "629.22", "change": "+118%"},
+        {"no": 215, "item": "3 x 185/95mm sq.", "itemAm": "3 x 185/95ሚሜ ካሬ", "unit": "Mtr", "march2026": "14,419.57", "june2026": "31,373.48", "change": "+118%"},
+        {"no": 216, "item": "1.5sq.mm cable", "itemAm": "1.5 ካሬ ሚሜ ኬብል", "unit": "Roll", "march2026": "3,823.37", "june2026": "6,707.28", "change": "+75%"},
+        {"no": 217, "item": "5*4 sq.mm cable", "itemAm": "5*4 ካሬ ሚሜ ኬብል", "unit": "Mtr", "march2026": "637.96", "june2026": "908.87", "change": "+42%"},
+        {"no": 218, "item": "4*10 FLEX", "itemAm": "4*10 ፍሌክስ", "unit": "Mtr", "march2026": "1,171.04", "june2026": "1,835.22", "change": "+57%"}
+      ]
+    },
+    {
+      "category": "LIGHTING, BREAKERS & SWITCHES",
+      "categoryAm": "መብራት፣ ብሬከሮች እና ስዊቾች",
+      "items": [
+        {"no": 219, "item": "3M HEIGHT", "itemAm": "3ሜ ከፍታ", "unit": "NO", "march2026": "21,847.83", "june2026": "21,847.83", "change": "0%"},
+        {"no": 220, "item": "6M HEIGHT", "itemAm": "6ሜ ከፍታ", "unit": "NO", "march2026": "28,839.13", "june2026": "28,839.13", "change": "0%"},
+        {"no": 221, "item": "8M HEIGHT", "itemAm": "8ሜ ከፍታ", "unit": "NO", "march2026": "55,930.43", "june2026": "55,930.43", "change": "0%"},
+        {"no": 222, "item": "12M HEIGHT", "itemAm": "12ሜ ከፍታ", "unit": "NO", "march2026": "104,869.57", "june2026": "104,869.57", "change": "0%"},
+        {"no": 223, "item": "10-32A/1P ACB ICU= 6KA", "itemAm": "10-32A/1P ACB ICU= 6KA", "unit": "NO", "march2026": "257.80", "june2026": "257.80", "change": "0%"},
+        {"no": 224, "item": "125A/3P MCCB “", "itemAm": "125A/3P MCCB “", "unit": "NO", "march2026": "5,658.59", "june2026": "5,658.59", "change": "0%"},
+        {"no": 225, "item": "CONTACTOR 25/3P", "itemAm": "ኮንታክተር 25/3P", "unit": "NO", "march2026": "2,971.30", "june2026": "2,971.30", "change": "0%"},
+        {"no": 226, "item": "FLUSH MOUNTED SINGLE", "itemAm": "ፍላሽ የሚገጠም ነጠላ", "unit": "NO", "march2026": "305.87", "june2026": "305.87", "change": "0%"}
+      ]
+    }
+ 
+  ]
+};END
+cat > src/data/goods.js << 'END'
+// src/data/goods.js
+import { putAll, getAll, put } from './db.js';
+import { GOODS } from './goods-data.js';
+
+function normalizeGoodsItem(catId, item, idx) {
+  const raw = String(item.june2026 || '').replace(/,/g, '').trim();
+  const price = raw === '' ? null : parseFloat(raw);
+  return {
+    id: 'goods:' + catId + ':' + (item.no || idx),
+    source: 'goods',
+    categoryId: 'goods:' + catId,
+    code: String(item.no || ''),
+    description: item.item || '',
+    descriptionAm: item.itemAm || '',
+    tenderAliases: [],
+    unit: item.unit || '',
+    basePrice: price,
+    contractorPrice: price,
+    page: 0
+  };
+}
+
+export async function importGoods(json) {
+  const src = json || GOODS;
+  if (!src || !Array.isArray(src.categories)) throw new Error('Invalid goods data');
+  const categories = [];
+  const items = [];
+  src.categories.forEach(cat => {
+    const catId = String(cat.category);
+    categories.push({
+      id: 'goods:' + catId,
+      source: 'goods',
+      title: cat.category,
+      titleAm: cat.categoryAm || cat.category,
+      itemCount: (cat.items || []).length
+    });
+    (cat.items || []).forEach((item, idx) => items.push(normalizeGoodsItem(catId, item, idx)));
+  });
+  await putAll('ratebook_categories', categories);
+  await putAll('ratebook_items', items);
+  await put('meta', {
+    key: 'goods_source',
+    source: src.source || '',
+    importedAt: new Date().toISOString(),
+    categoryCount: categories.length,
+    itemCount: items.length
+  });
+  return { categoryCount: categories.length, itemCount: items.length };
+}
+
+export async function getGoodsMeta() {
+  const rows = await getAll('meta');
+  return rows.find(r => r.key === 'goods_source') || null;
 }END
 cat > src/data/images.js << 'END'
 import { put, get, del } from './db.js';
@@ -2103,6 +2829,579 @@ export async function getAllProductImageURLs(ids) {
   }
   return out;
 }END
+cat > src/data/match.js << 'END'
+// Bilingual (English + Amharic) fuzzy matcher for rate-book lookup.
+// Aliases (tenderAliases) are treated as extra descriptions on each item.
+//
+// Anti-false-positive safeguards:
+//  - Extended English stop-words cover attribute/shape modifiers (double, thick, coated…)
+//  - Substring bonus requires >= 2 hits (one shared word is not enough)
+//  - Substring bonus requires tokens >= 4 chars (avoids 3-char collisions like "nut" / "m10")
+//  - Cross-category match is refused if token sets share nothing
+
+const STOP_EN = new Set([
+  'of','and','the','for','with','to','from','on','in','at','by','or','a','an',
+  'pcs','each','unit','no','nos','type','size','dia','mm','cm','m','kg','ton','tone',
+  'thick','inch','in',
+  // attribute / shape words that appear across categories
+  'double','single','thick','thin','long','short','large','small','big','mini',
+  'heavy','light','wide','narrow','high','low','new','old','standard','normal',
+  'coated','galvanized','painted','polished'
+]);
+
+const STOP_AM = new Set([
+  'እና','ወይም','ከ','ለ','በ','የ','ላይ','ውስጥ','ጋር','ነው','ና','ም','ን','ኦ','፣','።',
+  // shape words that cause cross-category false positives
+  'ድርብ','ነጠላ','ትልቅ','ትንሽ','ረዥም','አጭር','ከባድ','ቀላል','ሰፊ','ጠባብ'
+]);
+
+const UNIT_SYNONYMS = {
+  'pcs': 'each', 'nos': 'each', 'no': 'each',
+  'quintal': 'quintal', 'qtl': 'quintal',
+  'ton': 'ton', 'tone': 'ton', 't': 'ton',
+  'm3': 'm³', 'm³': 'm³', 'cum': 'm³',
+  'm2': 'm²', 'm²': 'm²', 'sqm': 'm²',
+  'ml': 'ml', 'lm': 'ml',
+  'kg': 'kg'
+};
+
+// ---------- Tokenizers ----------
+
+function tokenizeEn(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(t => t.length > 1 && !STOP_EN.has(t));
+}
+
+function tokenizeAm(text) {
+  return String(text || '')
+    .replace(/[^\u1200-\u137F\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(t => t.length > 1 && !STOP_AM.has(t));
+}
+
+function normUnit(u) {
+  const k = String(u || '').toLowerCase().trim();
+  return UNIT_SYNONYMS[k] || k;
+}
+
+function scoreTokens(a, b) {
+  const aSet = new Set(a), bSet = new Set(b);
+  let inter = 0;
+  for (const t of aSet) if (bSet.has(t)) inter++;
+  if (inter === 0) return 0;
+  const union = aSet.size + bSet.size - inter;
+  return inter / union;
+}
+
+// ---------- Index ----------
+
+export function buildIndex(rateItems) {
+  return rateItems.map(r => {
+    const aliases = r.tenderAliases || [];
+    return {
+      item: r,
+      tokensEn: tokenizeEn(r.description),
+      tokensAm: r.descriptionAm ? tokenizeAm(r.descriptionAm) : [],
+      aliasTokensEn: aliases.map(a => tokenizeEn(a)),
+      aliasTokensAm: aliases.map(a => tokenizeAm(a)),
+      unit: normUnit(r.unit),
+      lowerEn: String(r.description || '').toLowerCase(),
+      lowerAm: String(r.descriptionAm || '').toLowerCase(),
+      lowerAliases: aliases.map(a => String(a).toLowerCase())
+    };
+  });
+}
+
+// Score one pair of token sets with the guarded substring bonus.
+// Requires >= 2 substring hits on tokens of length >= 4 to apply the boost.
+function scorePair(tTokens, eTokens, eLower, isAmharic) {
+  const base = scoreTokens(tTokens, eTokens);
+
+  const minLen = 4;
+  let subHits = 0;
+  for (const tok of tTokens) {
+    if (tok.length < minLen) continue;
+    if (eLower.includes(tok)) subHits++;
+  }
+
+  let s = base;
+  if (subHits >= 2) {
+    s = Math.max(s, Math.min(0.9, 0.4 + subHits * 0.1));
+  }
+
+  const tStr = tTokens.join(' ');
+  if (tStr.length >= (isAmharic ? 4 : 6) && eLower.includes(tStr)) {
+    s = Math.min(1, s + 0.35);
+  }
+  return s;
+}
+
+// ---------- Single match ----------
+
+export function matchOne(tenderItem, index, opts = {}) {
+  const minScore = opts.minScore ?? 0.35;
+  const rawDesc = tenderItem.description || tenderItem.name || '';
+  const tEn = tokenizeEn(rawDesc);
+  const tAm = tokenizeAm(rawDesc);
+  const tUnit = normUnit(tenderItem.unit || tenderItem.unitMeasure);
+  const isAmharic = tAm.length > 0 && tEn.length < tAm.length;
+
+  if (tEn.length === 0 && tAm.length === 0) {
+    return { rate: 0, matched: false, score: 0 };
+  }
+
+  let best = null;
+  for (const entry of index) {
+    if (!entry.item.contractorPrice) continue;
+    if (entry.unit && tUnit && entry.unit !== tUnit) continue;
+
+    // Compute all candidate scores first
+    let s = 0;
+
+    if (isAmharic) {
+      if (entry.tokensAm.length > 0) {
+        s = Math.max(s, scorePair(tAm, entry.tokensAm, entry.lowerAm, true));
+      }
+      for (let i = 0; i < entry.aliasTokensAm.length; i++) {
+        if (entry.aliasTokensAm[i].length === 0) continue;
+        s = Math.max(s, scorePair(tAm, entry.aliasTokensAm[i], entry.lowerAliases[i] || '', true));
+      }
+    } else {
+      if (entry.tokensEn.length > 0) {
+        s = Math.max(s, scorePair(tEn, entry.tokensEn, entry.lowerEn, false));
+      }
+      for (let i = 0; i < entry.aliasTokensEn.length; i++) {
+        if (entry.aliasTokensEn[i].length === 0) continue;
+        s = Math.max(s, scorePair(tEn, entry.aliasTokensEn[i], entry.lowerAliases[i] || '', false));
+      }
+    }
+
+    // Hard gate: a real match must have either
+    //   (a) at least one shared token (Jaccard > 0 on either primary side), or
+    //   (b) a substring hit that already cleared the >= 2 threshold.
+    // Since scorePair returns 0 when neither applies, this is implicitly enforced.
+    // Nothing extra needed here — s stays 0 in that case.
+
+    if (!best || s > best.score) best = { score: s, entry };
+  }
+
+  if (!best || best.score < minScore) {
+    return { rate: 0, matched: false, score: best ? best.score : 0 };
+  }
+  return {
+    rate: best.entry.item.contractorPrice,
+    matched: true,
+    score: best.score,
+    matchItem: best.entry.item
+  };
+}
+
+// ---------- Bulk match ----------
+
+export function matchAll(tenderItems, index, opts) {
+  return tenderItems.map(it => {
+    if (it.rate > 0) return it;
+    const m = matchOne(it, index, opts);
+    return {
+      ...it,
+      rate: m.rate,
+      _match: {
+        matched: m.matched,
+        score: m.score,
+        source: m.matchItem
+      }
+    };
+  });
+}END
+cat > src/data/materials.js << 'END'
+// Bundled rate book — Addis Ababa Design and Construction Works Bureau
+// 2018 4th Quarter, Direct Cost Only, ETB
+// PASTE YOUR DATA BELOW, REPLACING THE EXAMPLE CATEGORY
+export const MATBOOK = {
+  "document": "construction-materials-ratebook.pdf",
+  "source": "Addis Ababa Design and Construction Works Bureau",
+  "quarter": "2018 4th Quarter (Direct Cost Only)",
+  "currency": "ETB",
+  "categories": [
+    {
+      "id": "M1",
+      "title": "CEMENT, AGGREGATE & SAND",
+      "titleAm": "ሲሚንቶ፣ ድምር እና አሸዋ",
+      "items": [
+        {"code":"M1.1","description":"Ordinary Portland Cement (OPC) 42.5R — 50kg bag","descriptionAm":"መደበኛ ፖርትላንድ ሲሚንቶ (OPC) 42.5R — 50ኪግ ከረጢት","unit":"bag","price":"1,450.00"},
+        {"code":"M1.2","description":"Ordinary Portland Cement (OPC) 32.5N — 50kg bag","descriptionAm":"መደበኛ ፖርትላንድ ሲሚንቶ (OPC) 32.5N — 50ኪግ ከረጢት","unit":"bag","price":"1,320.00"},
+        {"code":"M1.3","description":"Pozzolana Portland Cement (PPC) 32.5 — 50kg bag","descriptionAm":"ፖዞላና ፖርትላንድ ሲሚንቶ (PPC) 32.5 — 50ኪግ ከረጢት","unit":"bag","price":"1,250.00"},
+        {"code":"M1.4","description":"White cement — 40kg bag","descriptionAm":"ነጭ ሲሚንቶ — 40ኪግ ከረጢት","unit":"bag","price":"2,800.00"},
+        {"code":"M1.5","description":"Crushed stone aggregate 10–20mm (01)","descriptionAm":"የተፈጨ የድንጋይ ድምር 10–20ሚሜ (01)","unit":"m³","price":"1,850.00"},
+        {"code":"M1.6","description":"Crushed stone aggregate 5–10mm (02)","descriptionAm":"የተፈጨ የድንጋይ ድምር 5–10ሚሜ (02)","unit":"m³","price":"1,780.00"},
+        {"code":"M1.7","description":"Crushed stone dust (03)","descriptionAm":"የተፈጨ የድንጋይ ዱቄት (03)","unit":"m³","price":"1,300.00"},
+        {"code":"M1.8","description":"Washed river sand","descriptionAm":"የታጠበ የወንዝ አሸዋ","unit":"m³","price":"1,950.00"},
+        {"code":"M1.9","description":"Pit sand (unwashed)","descriptionAm":"የጉድጓድ አሸዋ (ያልታጠበ)","unit":"m³","price":"1,250.00"},
+        {"code":"M1.10","description":"Selected fill material","descriptionAm":"የተመረጠ የመሙያ ቁሳቁስ","unit":"m³","price":"650.00"},
+        {"code":"M1.11","description":"Red ash (pumice)","descriptionAm":"ቀይ አመድ (ፑሚስ)","unit":"m³","price":"1,100.00"},
+        {"code":"M1.12","description":"Lime (hydrated) — 25kg bag","descriptionAm":"ኖራ (ሃይድሬትድ) — 25ኪግ ከረጢት","unit":"bag","price":"480.00"}
+      ]
+    },
+    {
+      "id": "M2",
+      "title": "REINFORCEMENT STEEL & METAL",
+      "titleAm": "የማጠናከሪያ ብረት እና ብረታ ብረት",
+      "items": [
+        {"code":"M2.1","description":"Deformed rebar Grade 60 — dia. 6mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 6ሚሜ","unit":"kg","price":"128.00"},
+        {"code":"M2.2","description":"Deformed rebar Grade 60 — dia. 8mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 8ሚሜ","unit":"kg","price":"125.00"},
+        {"code":"M2.3","description":"Deformed rebar Grade 60 — dia. 10mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 10ሚሜ","unit":"kg","price":"124.00"},
+        {"code":"M2.4","description":"Deformed rebar Grade 60 — dia. 12mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 12ሚሜ","unit":"kg","price":"123.00"},
+        {"code":"M2.5","description":"Deformed rebar Grade 60 — dia. 14mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 14ሚሜ","unit":"kg","price":"123.00"},
+        {"code":"M2.6","description":"Deformed rebar Grade 60 — dia. 16mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 16ሚሜ","unit":"kg","price":"122.50"},
+        {"code":"M2.7","description":"Deformed rebar Grade 60 — dia. 20mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 20ሚሜ","unit":"kg","price":"122.00"},
+        {"code":"M2.8","description":"Deformed rebar Grade 60 — dia. 24mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 24ሚሜ","unit":"kg","price":"122.00"},
+        {"code":"M2.9","description":"Deformed rebar Grade 60 — dia. 32mm","descriptionAm":"ዲፎርምድ ሪባር ግሬድ 60 — ዲያሜትር 32ሚሜ","unit":"kg","price":"122.00"},
+        {"code":"M2.10","description":"Binding wire (soft annealed) 1.2mm","descriptionAm":"የማሰሪያ ሽቦ (ለስላሳ አኒልድ) 1.2ሚሜ","unit":"kg","price":"165.00"},
+        {"code":"M2.11","description":"RHS steel section 40x40x2mm","descriptionAm":"RHS የብረት ክፍል 40x40x2ሚሜ","unit":"kg","price":"135.00"},
+        {"code":"M2.12","description":"RHS steel section 50x50x2.5mm","descriptionAm":"RHS የብረት ክፍል 50x50x2.5ሚሜ","unit":"kg","price":"132.00"},
+        {"code":"M2.13","description":"Angle iron 40x40x3mm","descriptionAm":"አንግል ብረት 40x40x3ሚሜ","unit":"kg","price":"128.00"},
+        {"code":"M2.14","description":"Angle iron 50x50x5mm","descriptionAm":"አንግል ብረት 50x50x5ሚሜ","unit":"kg","price":"126.00"},
+        {"code":"M2.15","description":"Flat bar 25x3mm","descriptionAm":"ፍላት ባር 25x3ሚሜ","unit":"kg","price":"130.00"},
+        {"code":"M2.16","description":"CHS steel pipe dia. 48mm x 2.5mm","descriptionAm":"CHS የብረት ቧንቧ ዲያሜትር 48ሚሜ x 2.5ሚሜ","unit":"kg","price":"138.00"},
+        {"code":"M2.17","description":"Galvanized corrugated iron sheet G-28 (0.4mm)","descriptionAm":"ጋልቫናይዝድ ኮርጌትድ ብረት ሉህ G-28 (0.4ሚሜ)","unit":"m²","price":"620.00"},
+        {"code":"M2.18","description":"Galvanized corrugated iron sheet G-30 (0.35mm)","descriptionAm":"ጋልቫናይዝድ ኮርጌትድ ብረት ሉህ G-30 (0.35ሚሜ)","unit":"m²","price":"540.00"},
+        {"code":"M2.19","description":"Galvanized corrugated iron sheet G-32 (0.3mm)","descriptionAm":"ጋልቫናይዝድ ኮርጌትድ ብረት ሉህ G-32 (0.3ሚሜ)","unit":"m²","price":"470.00"},
+        {"code":"M2.20","description":"Lamera sheet 1mm thick","descriptionAm":"ላሜራ ሉህ 1ሚሜ ውፍረት","unit":"m²","price":"1,350.00"}
+      ]
+    },
+    {
+      "id": "M3",
+      "title": "MASONRY & BLOCK MATERIALS",
+      "titleAm": "የግንበኝነት እና የብሎክ ቁሳቁሶች",
+      "items": [
+        {"code":"M3.1","description":"HCB hollow block 10cm thick (class C)","descriptionAm":"HCB ባዶ ብሎክ 10ሴንቲ ሜትር ውፍረት (ክላስ C)","unit":"pcs","price":"32.00"},
+        {"code":"M3.2","description":"HCB hollow block 15cm thick (class C)","descriptionAm":"HCB ባዶ ብሎክ 15ሴንቲ ሜትር ውፍረት (ክላስ C)","unit":"pcs","price":"48.00"},
+        {"code":"M3.3","description":"HCB hollow block 20cm thick (class C)","descriptionAm":"HCB ባዶ ብሎክ 20ሴንቲ ሜትር ውፍረት (ክላስ C)","unit":"pcs","price":"62.00"},
+        {"code":"M3.4","description":"HCB hollow block 20cm thick (class A)","descriptionAm":"HCB ባዶ ብሎክ 20ሴንቲ ሜትር ውፍረት (ክላስ A)","unit":"pcs","price":"78.00"},
+        {"code":"M3.5","description":"Solid concrete block 10cm thick","descriptionAm":"ሶሊድ ኮንክሪት ብሎክ 10ሴንቲ ሜትር ውፍረት","unit":"pcs","price":"42.00"},
+        {"code":"M3.6","description":"Solid concrete block 15cm thick","descriptionAm":"ሶሊድ ኮንክሪት ብሎክ 15ሴንቲ ሜትር ውፍረት","unit":"pcs","price":"58.00"},
+        {"code":"M3.7","description":"Solid concrete block 20cm thick","descriptionAm":"ሶሊድ ኮንክሪት ብሎክ 20ሴንቲ ሜትር ውፍረት","unit":"pcs","price":"75.00"},
+        {"code":"M3.8","description":"Red clay brick (single)","descriptionAm":"ቀይ ሸክላ ጡብ (ነጠላ)","unit":"pcs","price":"18.00"},
+        {"code":"M3.9","description":"Red clay brick (double)","descriptionAm":"ቀይ ሸክላ ጡብ (ድርብ)","unit":"pcs","price":"26.00"},
+        {"code":"M3.10","description":"Dressed basalt stone (for masonry)","descriptionAm":"የተጠረበ የባዝልት ድንጋይ (ለግንበኝነት)","unit":"m³","price":"2,400.00"},
+        {"code":"M3.11","description":"Rough basalt stone (for masonry)","descriptionAm":"ሻካራ የባዝልት ድንጋይ (ለግንበኝነት)","unit":"m³","price":"1,500.00"},
+        {"code":"M3.12","description":"Ambo stone (tuff) for cladding","descriptionAm":"የአምቦ ድንጋይ (ቱፍ) ለሽፋን","unit":"m²","price":"850.00"},
+        {"code":"M3.13","description":"Chipwood board 8mm thick","descriptionAm":"ቺፕዉድ ቦርድ 8ሚሜ ውፍረት","unit":"m²","price":"420.00"},
+        {"code":"M3.14","description":"MDF board 18mm thick (laminated)","descriptionAm":"MDF ቦርድ 18ሚሜ ውፍረት (ላሚኔትድ)","unit":"m²","price":"1,250.00"},
+        {"code":"M3.15","description":"Gypsum board 12mm thick","descriptionAm":"ጂፕሰም ቦርድ 12ሚሜ ውፍረት","unit":"m²","price":"380.00"}
+      ]
+    },
+    {
+      "id": "M4",
+      "title": "TIMBER & WOOD PRODUCTS",
+      "titleAm": "እንጨት እና የእንጨት ውጤቶች",
+      "items": [
+        {"code":"M4.1","description":"Eucalyptus pole dia. 8–10cm","descriptionAm":"የባህር ዛፍ ምሰሶ ዲያሜትር 8–10ሴንቲ ሜትር","unit":"ml","price":"85.00"},
+        {"code":"M4.2","description":"Eucalyptus pole dia. 10–12cm","descriptionAm":"የባህር ዛፍ ምሰሶ ዲያሜትር 10–12ሴንቲ ሜትር","unit":"ml","price":"120.00"},
+        {"code":"M4.3","description":"Shashemene batten 5x4cm","descriptionAm":"ሻሸመኔ ባትን 5x4ሴንቲ ሜትር","unit":"ml","price":"28.00"},
+        {"code":"M4.4","description":"Shashemene batten 5x7cm","descriptionAm":"ሻሸመኔ ባትን 5x7ሴንቲ ሜትር","unit":"ml","price":"48.00"},
+        {"code":"M4.5","description":"Zigba purlin 4x5cm","descriptionAm":"ዚግባ ፐርላይን 4x5ሴንቲ ሜትር","unit":"ml","price":"65.00"},
+        {"code":"M4.6","description":"Zigba purlin 5x7cm","descriptionAm":"ዚግባ ፐርላይን 5x7ሴንቲ ሜትር","unit":"ml","price":"95.00"},
+        {"code":"M4.7","description":"Tsid (Tid) timber 1cm thick","descriptionAm":"ጽድ (ጥድ) እንጨት 1ሴንቲ ሜትር ውፍረት","unit":"m²","price":"680.00"},
+        {"code":"M4.8","description":"Plywood 4mm thick","descriptionAm":"ፕላይዉድ 4ሚሜ ውፍረት","unit":"m²","price":"520.00"},
+        {"code":"M4.9","description":"Plywood 18mm thick (fair-faced)","descriptionAm":"ፕላይዉድ 18ሚሜ ውፍረት (ፌር-ፌስድ)","unit":"m²","price":"1,450.00"},
+        {"code":"M4.10","description":"Mahogany plywood 40mm (door grade)","descriptionAm":"ማሆጋኒ ፕላይዉድ 40ሚሜ (የበር ደረጃ)","unit":"m²","price":"4,200.00"},
+        {"code":"M4.11","description":"Kerrero facia board 25cm wide","descriptionAm":"ቄረሮ ፋሺያ ቦርድ 25ሴንቲ ሜትር ስፋት","unit":"ml","price":"380.00"},
+        {"code":"M4.12","description":"Kerrero facia board 30cm wide","descriptionAm":"ቄረሮ ፋሺያ ቦርድ 30ሴንቲ ሜትር ስፋት","unit":"ml","price":"450.00"},
+        {"code":"M4.13","description":"Wood preservative (anti-termite)","descriptionAm":"የእንጨት መከላከያ (ጸረ-ምስጥ)","unit":"lt","price":"320.00"}
+      ]
+    },
+    {
+      "id": "M5",
+      "title": "ROOFING MATERIALS",
+      "titleAm": "የጣሪያ ቁሳቁሶች",
+      "items": [
+        {"code":"M5.1","description":"EGA 300 galvanized roof sheet 0.30mm","descriptionAm":"EGA 300 ጋልቫናይዝድ የጣሪያ ሉህ 0.30ሚሜ","unit":"m²","price":"780.00"},
+        {"code":"M5.2","description":"EGA 300 galvanized roof sheet 0.40mm","descriptionAm":"EGA 300 ጋልቫናይዝድ የጣሪያ ሉህ 0.40ሚሜ","unit":"m²","price":"980.00"},
+        {"code":"M5.3","description":"EGA 400 galvanized roof sheet 0.40mm","descriptionAm":"EGA 400 ጋልቫናይዝድ የጣሪያ ሉህ 0.40ሚሜ","unit":"m²","price":"1,100.00"},
+        {"code":"M5.4","description":"EGA 500 galvanized roof sheet 0.50mm","descriptionAm":"EGA 500 ጋልቫናይዝድ የጣሪያ ሉህ 0.50ሚሜ","unit":"m²","price":"1,320.00"},
+        {"code":"M5.5","description":"Pre-painted (colour) roof sheet 0.40mm","descriptionAm":"ቅድመ-ቀለም (ባለቀለም) የጣሪያ ሉህ 0.40ሚሜ","unit":"m²","price":"1,450.00"},
+        {"code":"M5.6","description":"Pre-painted (colour) roof sheet 0.50mm","descriptionAm":"ቅድመ-ቀለም (ባለቀለም) የጣሪያ ሉህ 0.50ሚሜ","unit":"m²","price":"1,680.00"},
+        {"code":"M5.7","description":"Roof ridge (G-28) 33cm dev. length","descriptionAm":"የጣሪያ ሪጅ (G-28) 33ሴንቲ ሜትር dev. ርዝመት","unit":"ml","price":"520.00"},
+        {"code":"M5.8","description":"Roof ridge (G-30) 50cm dev. length","descriptionAm":"የጣሪያ ሪጅ (G-30) 50ሴንቲ ሜትር dev. ርዝመት","unit":"ml","price":"610.00"},
+        {"code":"M5.9","description":"Galvanized flashing (G-28) 50cm dev. length","descriptionAm":"ጋልቫናይዝድ ፍላሽንግ (G-28) 50ሴንቲ ሜትር dev. ርዝመት","unit":"ml","price":"580.00"},
+        {"code":"M5.10","description":"Galvanized copping (G-28) 33cm dev. length","descriptionAm":"ጋልቫናይዝድ ኮፒንግ (G-28) 33ሴንቲ ሜትር dev. ርዝመት","unit":"ml","price":"540.00"},
+        {"code":"M5.11","description":"Euro tile roof cover","descriptionAm":"የዩሮ ታይል ጣሪያ ሽፋን","unit":"m²","price":"720.00"},
+        {"code":"M5.12","description":"Asbestos roof sheet","descriptionAm":"የአስቤስቶስ የጣሪያ ሉህ","unit":"m²","price":"480.00"},
+        {"code":"M5.13","description":"Transparent fiber roof sheet 2mm (corrugated)","descriptionAm":"ግልጽ ፋይበር የጣሪያ ሉህ 2ሚሜ (ኮርጌትድ)","unit":"m²","price":"620.00"},
+        {"code":"M5.14","description":"PVC down pipe dia. 75mm","descriptionAm":"PVC የውሃ ማውረጃ ቧንቧ ዲያሜትር 75ሚሜ","unit":"ml","price":"340.00"},
+        {"code":"M5.15","description":"PVC down pipe dia. 110mm","descriptionAm":"PVC የውሃ ማውረጃ ቧንቧ ዲያሜትር 110ሚሜ","unit":"ml","price":"420.00"},
+        {"code":"M5.16","description":"Roofing nail (umbrella head) 3\"","descriptionAm":"የጣሪያ ምስማር (ጃንጥላ ራስ) 3\"","unit":"kg","price":"185.00"},
+        {"code":"M5.17","description":"Roofing screw with washer (self-drilling)","descriptionAm":"የጣሪያ ብሎን ከዋሽር ጋር (ራሱን የሚቆፍር)","unit":"pcs","price":"8.50"}
+      ]
+    },
+    {
+      "id": "M6",
+      "title": "FASTENERS, NAILS & FIXINGS",
+      "titleAm": "ማያያዣዎች፣ ምስማሮች እና መገጣጠሚያዎች",
+      "items": [
+        {"code":"M6.1","description":"Common wire nail 1\"","descriptionAm":"የተለመደ ሽቦ ምስማር 1\"","unit":"kg","price":"145.00"},
+        {"code":"M6.2","description":"Common wire nail 1.5\"","descriptionAm":"የተለመደ ሽቦ ምስማር 1.5\"","unit":"kg","price":"142.00"},
+        {"code":"M6.3","description":"Common wire nail 2\"","descriptionAm":"የተለመደ ሽቦ ምስማር 2\"","unit":"kg","price":"140.00"},
+        {"code":"M6.4","description":"Common wire nail 3\"","descriptionAm":"የተለመደ ሽቦ ምስማር 3\"","unit":"kg","price":"138.00"},
+        {"code":"M6.5","description":"Common wire nail 4\"","descriptionAm":"የተለመደ ሽቦ ምስማር 4\"","unit":"kg","price":"136.00"},
+        {"code":"M6.6","description":"Concrete nail 2\"","descriptionAm":"የኮንክሪት ምስማር 2\"","unit":"kg","price":"175.00"},
+        {"code":"M6.7","description":"Concrete nail 3\"","descriptionAm":"የኮንክሪት ምስማር 3\"","unit":"kg","price":"172.00"},
+        {"code":"M6.8","description":"Galvanized wire nail 2\"","descriptionAm":"ጋልቫናይዝድ ሽቦ ምስማር 2\"","unit":"kg","price":"165.00"},
+        {"code":"M6.9","description":"Wood screw 1\" (box)","descriptionAm":"የእንጨት ብሎን 1\" (ሳጥን)","unit":"box","price":"480.00"},
+        {"code":"M6.10","description":"Wood screw 2\" (box)","descriptionAm":"የእንጨት ብሎን 2\" (ሳጥን)","unit":"box","price":"620.00"},
+        {"code":"M6.11","description":"Self-tapping screw 1\" (box)","descriptionAm":"ራሱን የሚቆፍር ብሎን 1\" (ሳጥን)","unit":"box","price":"550.00"},
+        {"code":"M6.12","description":"Anchor bolt dia. 16mm x 400mm (J-bolt)","descriptionAm":"አንከር ቦልት ዲያሜትር 16ሚሜ x 400ሚሜ (J-ቦልት)","unit":"pcs","price":"145.00"},
+        {"code":"M6.13","description":"Anchor bolt dia. 20mm x 400mm","descriptionAm":"አንከር ቦልት ዲያሜትር 20ሚሜ x 400ሚሜ","unit":"pcs","price":"210.00"},
+        {"code":"M6.14","description":"Rawl plug (plastic) dia. 8mm","descriptionAm":"ራውል ፕላግ (ፕላስቲክ) ዲያሜትር 8ሚሜ","unit":"pcs","price":"2.50"},
+        {"code":"M6.15","description":"Rawl plug (plastic) dia. 10mm","descriptionAm":"ራውል ፕላግ (ፕላስቲክ) ዲያሜትር 10ሚሜ","unit":"pcs","price":"3.50"}
+      ]
+    },
+    {
+      "id": "M7",
+      "title": "PLUMBING MATERIALS",
+      "titleAm": "የቧንቧ ቁሳቁሶች",
+      "items": [
+        {"code":"M7.1","description":"PPR pipe dia. 20mm (1/2\")","descriptionAm":"PPR ቧንቧ ዲያሜትር 20ሚሜ (1/2\")","unit":"ml","price":"145.00"},
+        {"code":"M7.2","description":"PPR pipe dia. 25mm (3/4\")","descriptionAm":"PPR ቧንቧ ዲያሜትር 25ሚሜ (3/4\")","unit":"ml","price":"195.00"},
+        {"code":"M7.3","description":"PPR pipe dia. 32mm (1\")","descriptionAm":"PPR ቧንቧ ዲያሜትር 32ሚሜ (1\")","unit":"ml","price":"280.00"},
+        {"code":"M7.4","description":"PPR pipe dia. 40mm (11/4\")","descriptionAm":"PPR ቧንቧ ዲያሜትር 40ሚሜ (11/4\")","unit":"ml","price":"420.00"},
+        {"code":"M7.5","description":"PPR pipe dia. 50mm (11/2\")","descriptionAm":"PPR ቧንቧ ዲያሜትር 50ሚሜ (11/2\")","unit":"ml","price":"620.00"},
+        {"code":"M7.6","description":"Galvanized steel pipe 15mm (1/2\")","descriptionAm":"ጋልቫናይዝድ ብረት ቧንቧ 15ሚሜ (1/2\")","unit":"ml","price":"480.00"},
+        {"code":"M7.7","description":"Galvanized steel pipe 20mm (3/4\")","descriptionAm":"ጋልቫናይዝድ ብረት ቧንቧ 20ሚሜ (3/4\")","unit":"ml","price":"580.00"},
+        {"code":"M7.8","description":"Galvanized steel pipe 25mm (1\")","descriptionAm":"ጋልቫናይዝድ ብረት ቧንቧ 25ሚሜ (1\")","unit":"ml","price":"720.00"},
+        {"code":"M7.9","description":"Galvanized steel pipe 50mm (2\")","descriptionAm":"ጋልቫናይዝድ ብረት ቧንቧ 50ሚሜ (2\")","unit":"ml","price":"1,350.00"},
+        {"code":"M7.10","description":"UPVC pipe dia. 50mm (waste)","descriptionAm":"UPVC ቧንቧ ዲያሜትር 50ሚሜ (ቆሻሻ)","unit":"ml","price":"185.00"},
+        {"code":"M7.11","description":"UPVC pipe dia. 75mm (waste)","descriptionAm":"UPVC ቧንቧ ዲያሜትር 75ሚሜ (ቆሻሻ)","unit":"ml","price":"265.00"},
+        {"code":"M7.12","description":"UPVC pipe dia. 110mm (soil)","descriptionAm":"UPVC ቧንቧ ዲያሜትር 110ሚሜ (ሶይል)","unit":"ml","price":"385.00"},
+        {"code":"M7.13","description":"UPVC pipe dia. 160mm (soil)","descriptionAm":"UPVC ቧንቧ ዲያሜትር 160ሚሜ (ሶይል)","unit":"ml","price":"680.00"},
+        {"code":"M7.14","description":"UPVC pipe dia. 200mm (soil)","descriptionAm":"UPVC ቧንቧ ዲያሜትር 200ሚሜ (ሶይል)","unit":"ml","price":"950.00"},
+        {"code":"M7.15","description":"HDPE pipe dia. 25mm","descriptionAm":"HDPE ቧንቧ ዲያሜትር 25ሚሜ","unit":"ml","price":"165.00"},
+        {"code":"M7.16","description":"HDPE pipe dia. 32mm","descriptionAm":"HDPE ቧንቧ ዲያሜትር 32ሚሜ","unit":"ml","price":"220.00"},
+        {"code":"M7.17","description":"PPR elbow 20mm","descriptionAm":"PPR ክርን 20ሚሜ","unit":"pcs","price":"28.00"},
+        {"code":"M7.18","description":"PPR elbow 25mm","descriptionAm":"PPR ክርን 25ሚሜ","unit":"pcs","price":"38.00"},
+        {"code":"M7.19","description":"PPR tee 20mm","descriptionAm":"PPR ቲ 20ሚሜ","unit":"pcs","price":"35.00"},
+        {"code":"M7.20","description":"PPR coupling 20mm","descriptionAm":"PPR አገናኝ 20ሚሜ","unit":"pcs","price":"22.00"},
+        {"code":"M7.21","description":"UPVC elbow 110mm","descriptionAm":"UPVC ክርን 110ሚሜ","unit":"pcs","price":"95.00"},
+        {"code":"M7.22","description":"UPVC tee 110mm","descriptionAm":"UPVC ቲ 110ሚሜ","unit":"pcs","price":"120.00"},
+        {"code":"M7.23","description":"UPVC coupling 110mm","descriptionAm":"UPVC አገናኝ 110ሚሜ","unit":"pcs","price":"75.00"},
+        {"code":"M7.24","description":"PPR welding machine (hot fusion)","descriptionAm":"PPR ብየዳ ማሽን (ሙቅ ውህደት)","unit":"pcs","price":"6,500.00"}
+      ]
+    },
+    {
+      "id": "M8",
+      "title": "VALVES & FITTINGS",
+      "titleAm": "ቫልቮች እና መገጣጠሚያዎች",
+      "items": [
+        {"code":"M8.1","description":"Brass gate valve PN16 1/2\"","descriptionAm":"የናስ ጌት ቫልቭ PN16 1/2\"","unit":"pcs","price":"720.00"},
+        {"code":"M8.2","description":"Brass gate valve PN16 3/4\"","descriptionAm":"የናስ ጌት ቫልቭ PN16 3/4\"","unit":"pcs","price":"980.00"},
+        {"code":"M8.3","description":"Brass gate valve PN16 1\"","descriptionAm":"የናስ ጌት ቫልቭ PN16 1\"","unit":"pcs","price":"1,350.00"},
+        {"code":"M8.4","description":"Brass gate valve PN16 11/2\"","descriptionAm":"የናስ ጌት ቫልቭ PN16 11/2\"","unit":"pcs","price":"2,250.00"},
+        {"code":"M8.5","description":"Brass gate valve PN16 2\"","descriptionAm":"የናስ ጌት ቫልቭ PN16 2\"","unit":"pcs","price":"3,100.00"},
+        {"code":"M8.6","description":"Bronze gate valve PN16 2\"","descriptionAm":"የብሮንዝ ጌት ቫልቭ PN16 2\"","unit":"pcs","price":"4,850.00"},
+        {"code":"M8.7","description":"Bronze gate valve PN16 3\"","descriptionAm":"የብሮንዝ ጌት ቫልቭ PN16 3\"","unit":"pcs","price":"6,900.00"},
+        {"code":"M8.8","description":"Cast iron gate valve PN16 100mm","descriptionAm":"የብረት ጌት ቫልቭ PN16 100ሚሜ","unit":"pcs","price":"18,500.00"},
+        {"code":"M8.9","description":"Cast iron gate valve PN16 150mm","descriptionAm":"የብረት ጌት ቫልቭ PN16 150ሚሜ","unit":"pcs","price":"26,400.00"},
+        {"code":"M8.10","description":"Float valve 1/2\"","descriptionAm":"ፍሎት ቫልቭ 1/2\"","unit":"pcs","price":"680.00"},
+        {"code":"M8.11","description":"Float valve 3/4\"","descriptionAm":"ፍሎት ቫልቭ 3/4\"","unit":"pcs","price":"920.00"},
+        {"code":"M8.12","description":"Check valve (non-return) 1\"","descriptionAm":"ቼክ ቫልቭ (የማይመለስ) 1\"","unit":"pcs","price":"1,450.00"},
+        {"code":"M8.13","description":"Check valve (non-return) 2\"","descriptionAm":"ቼክ ቫልቭ (የማይመለስ) 2\"","unit":"pcs","price":"3,200.00"},
+        {"code":"M8.14","description":"Water meter dia. 25mm","descriptionAm":"የውሃ ሜትር ዲያሜትር 25ሚሜ","unit":"pcs","price":"1,850.00"},
+        {"code":"M8.15","description":"Water meter dia. 50mm","descriptionAm":"የውሃ ሜትር ዲያሜትር 50ሚሜ","unit":"pcs","price":"4,200.00"},
+        {"code":"M8.16","description":"Floor drain 50mm (chrome plated)","descriptionAm":"የወለል ፍሳሽ 50ሚሜ (ክሮም የተለበጠ)","unit":"pcs","price":"850.00"},
+        {"code":"M8.17","description":"Floor drain 100mm (chrome plated)","descriptionAm":"የወለል ፍሳሽ 100ሚሜ (ክሮም የተለበጠ)","unit":"pcs","price":"1,450.00"},
+        {"code":"M8.18","description":"Clean out cover 110mm","descriptionAm":"የማጽጃ ክዳን 110ሚሜ","unit":"pcs","price":"680.00"},
+        {"code":"M8.19","description":"Vent cap 100mm","descriptionAm":"የአየር ማስወጫ ክዳን 100ሚሜ","unit":"pcs","price":"220.00"}
+      ]
+    },
+    {
+      "id": "M9",
+      "title": "SANITARY MATERIALS",
+      "titleAm": "የሳኒቴሪ ቁሳቁሶች",
+      "items": [
+        {"code":"M9.1","description":"Water closet (WC) low flush, white ceramic, complete set","descriptionAm":"የውሃ ሽንኩርት ቤት (WC) ሎው ፍላሽ፣ ነጭ ሴራሚክ፣ ሙሉ ስብስብ","unit":"pcs","price":"12,500.00"},
+        {"code":"M9.2","description":"Water closet (WC) low flush, RAK brand","descriptionAm":"የውሃ ሽንኩርት ቤት (WC) ሎው ፍላሽ፣ RAK ብራንድ","unit":"pcs","price":"22,800.00"},
+        {"code":"M9.3","description":"Turkish type WC (squat pan), white ceramic","descriptionAm":"የቱርክ ዓይነት WC (ስኳት ፓን)፣ ነጭ ሴራሚክ","unit":"pcs","price":"5,400.00"},
+        {"code":"M9.4","description":"Wash hand basin (HWB) 45x55cm, complete set","descriptionAm":"እጅ ማጠቢያ (HWB) 45x55ሴንቲ ሜትር፣ ሙሉ ስብስብ","unit":"pcs","price":"9,800.00"},
+        {"code":"M9.5","description":"Wash hand basin (HWB) 45x55cm, RAK brand","descriptionAm":"እጅ ማጠቢያ (HWB) 45x55ሴንቲ ሜትር፣ RAK ብራንድ","unit":"pcs","price":"16,500.00"},
+        {"code":"M9.6","description":"Urinal wall-hung, white glazed","descriptionAm":"ሽንት ቤት ግድግዳ ላይ የሚንጠለጠል፣ ነጭ ግሌዝድ","unit":"pcs","price":"8,200.00"},
+        {"code":"M9.7","description":"Kitchen sink double bowl (stainless steel)","descriptionAm":"የወጥ ቤት ማጠቢያ ድርብ ጎድጓዳ (ስቴንሌስ ስቲል)","unit":"pcs","price":"7,500.00"},
+        {"code":"M9.8","description":"Kitchen sink single bowl (stainless steel)","descriptionAm":"የወጥ ቤት ማጠቢያ ነጠላ ጎድጓዳ (ስቴንሌስ ስቲል)","unit":"pcs","price":"5,800.00"},
+        {"code":"M9.9","description":"Shower box 90x90cm","descriptionAm":"የሻወር ሳጥን 90x90ሴንቲ ሜትር","unit":"pcs","price":"32,000.00"},
+        {"code":"M9.10","description":"Bath tub 70x170cm (standard)","descriptionAm":"ገላ መታጠቢያ ገንዳ 70x170ሴንቲ ሜትር (መደበኛ)","unit":"pcs","price":"38,500.00"},
+        {"code":"M9.11","description":"Bath tub 70x170cm (fiber glass)","descriptionAm":"ገላ መታጠቢያ ገንዳ 70x170ሴንቲ ሜትር (ፋይበር ግላስ)","unit":"pcs","price":"28,000.00"},
+        {"code":"M9.12","description":"Water heater 50lt (electric)","descriptionAm":"የውሃ ማሞቂያ 50lt (ኤሌክትሪክ)","unit":"pcs","price":"26,500.00"},
+        {"code":"M9.13","description":"Water heater 80lt (electric)","descriptionAm":"የውሃ ማሞቂያ 80lt (ኤሌክትሪክ)","unit":"pcs","price":"35,800.00"},
+        {"code":"M9.14","description":"Water heater 100lt (electric)","descriptionAm":"የውሃ ማሞቂያ 100lt (ኤሌክትሪክ)","unit":"pcs","price":"46,500.00"},
+        {"code":"M9.15","description":"Instant water heater","descriptionAm":"ፈጣን የውሃ ማሞቂያ","unit":"pcs","price":"18,500.00"},
+        {"code":"M9.16","description":"Mirror 60x80cm (bathroom)","descriptionAm":"መስታወት 60x80ሴንቲ ሜትር (የመታጠቢያ ቤት)","unit":"pcs","price":"2,800.00"},
+        {"code":"M9.17","description":"Towel rail (chrome)","descriptionAm":"የፎጣ መወርወሪያ (ክሮም)","unit":"pcs","price":"1,200.00"},
+        {"code":"M9.18","description":"Soap dish (ceramic)","descriptionAm":"የሳሙና ሳህን (ሴራሚክ)","unit":"pcs","price":"650.00"}
+      ]
+    },
+    {
+      "id": "M10",
+      "title": "ELECTRICAL MATERIALS",
+      "titleAm": "የኤሌክትሪክ ቁሳቁሶች",
+      "items": [
+        {"code":"M10.1","description":"PVC insulated cable 2x2.5mm²","descriptionAm":"PVC የተከለለ ኬብል 2x2.5mm²","unit":"ml","price":"185.00"},
+        {"code":"M10.2","description":"PVC insulated cable 3x2.5mm²","descriptionAm":"PVC የተከለለ ኬብል 3x2.5mm²","unit":"ml","price":"265.00"},
+        {"code":"M10.3","description":"PVC insulated cable 3x4mm²","descriptionAm":"PVC የተከለለ ኬብል 3x4mm²","unit":"ml","price":"380.00"},
+        {"code":"M10.4","description":"PVC insulated cable 3x6mm²","descriptionAm":"PVC የተከለለ ኬብል 3x6mm²","unit":"ml","price":"620.00"},
+        {"code":"M10.5","description":"PVC insulated cable 5x4mm²","descriptionAm":"PVC የተከለለ ኬብል 5x4mm²","unit":"ml","price":"580.00"},
+        {"code":"M10.6","description":"PVC insulated cable 5x6mm²","descriptionAm":"PVC የተከለለ ኬብል 5x6mm²","unit":"ml","price":"980.00"},
+        {"code":"M10.7","description":"PVC conduit (rigid) dia. 16mm","descriptionAm":"PVC ቱቦ (ሪጅድ) ዲያሜትር 16ሚሜ","unit":"ml","price":"32.00"},
+        {"code":"M10.8","description":"PVC conduit (rigid) dia. 25mm","descriptionAm":"PVC ቱቦ (ሪጅድ) ዲያሜትር 25ሚሜ","unit":"ml","price":"45.00"},
+        {"code":"M10.9","description":"PVC conduit (rigid) dia. 32mm","descriptionAm":"PVC ቱቦ (ሪጅድ) ዲያሜትር 32ሚሜ","unit":"ml","price":"65.00"},
+        {"code":"M10.10","description":"PVC conduit (rigid) dia. 50mm","descriptionAm":"PVC ቱቦ (ሪጅድ) ዲያሜትር 50ሚሜ","unit":"ml","price":"120.00"},
+        {"code":"M10.11","description":"Flexible PVC conduit dia. 16mm","descriptionAm":"ተለዋዋጭ PVC ቱቦ ዲያሜትር 16ሚሜ","unit":"ml","price":"38.00"},
+        {"code":"M10.12","description":"Flexible PVC conduit dia. 25mm","descriptionAm":"ተለዋዋጭ PVC ቱቦ ዲያሜትር 25ሚሜ","unit":"ml","price":"55.00"},
+        {"code":"M10.13","description":"Junction box (PVC) 100x100mm","descriptionAm":"መገናኛ ሳጥን (PVC) 100x100ሚሜ","unit":"pcs","price":"45.00"},
+        {"code":"M10.14","description":"Single switch 10A (flush mounted)","descriptionAm":"ነጠላ ስዊች 10A (ፍላሽ የሚገጠም)","unit":"pcs","price":"120.00"},
+        {"code":"M10.15","description":"Double switch 10A (flush mounted)","descriptionAm":"ድርብ ስዊች 10A (ፍላሽ የሚገጠም)","unit":"pcs","price":"185.00"},
+        {"code":"M10.16","description":"Single socket 16A (flush mounted)","descriptionAm":"ነጠላ ሶኬት 16A (ፍላሽ የሚገጠም)","unit":"pcs","price":"165.00"},
+        {"code":"M10.17","description":"Double socket 16A (flush mounted)","descriptionAm":"ድርብ ሶኬት 16A (ፍላሽ የሚገጠም)","unit":"pcs","price":"245.00"},
+        {"code":"M10.18","description":"MCB 16A single pole","descriptionAm":"MCB 16A ነጠላ ፖል","unit":"pcs","price":"280.00"},
+        {"code":"M10.19","description":"MCB 32A single pole","descriptionAm":"MCB 32A ነጠላ ፖል","unit":"pcs","price":"350.00"},
+        {"code":"M10.20","description":"MCB 63A three pole","descriptionAm":"MCB 63A ሶስት ፖል","unit":"pcs","price":"850.00"},
+        {"code":"M10.21","description":"RCD 30mA/2 pole","descriptionAm":"RCD 30mA/2 ፖል","unit":"pcs","price":"2,200.00"},
+        {"code":"M10.22","description":"RCD 100mA/4 pole","descriptionAm":"RCD 100mA/4 ፖል","unit":"pcs","price":"4,500.00"},
+        {"code":"M10.23","description":"Distribution board (surface) 8-way","descriptionAm":"ማከፋፈያ ቦርድ (ገጽ) 8-መንገድ","unit":"pcs","price":"2,800.00"},
+        {"code":"M10.24","description":"Distribution board (surface) 16-way","descriptionAm":"ማከፋፈያ ቦርድ (ገጽ) 16-መንገድ","unit":"pcs","price":"4,500.00"},
+        {"code":"M10.25","description":"LED panel light 60x60cm 48W","descriptionAm":"LED ፓነል መብራት 60x60ሴንቲ ሜትር 48W","unit":"pcs","price":"2,850.00"},
+        {"code":"M10.26","description":"LED bulb 12W (E27)","descriptionAm":"LED አምፖል 12W (E27)","unit":"pcs","price":"180.00"},
+        {"code":"M10.27","description":"LED flood light 100W","descriptionAm":"LED ፍሎድ መብራት 100W","unit":"pcs","price":"3,500.00"},
+        {"code":"M10.28","description":"Copper earth rod 16mm x 1500mm","descriptionAm":"የመዳብ የመሬት ዘንግ 16ሚሜ x 1500ሚሜ","unit":"pcs","price":"3,200.00"},
+        {"code":"M10.29","description":"Bare copper conductor 70mm²","descriptionAm":"ባዶ መዳብ ኮንዳክተር 70mm²","unit":"ml","price":"1,450.00"},
+        {"code":"M10.30","description":"Galvanized steel cable tray 100x50mm","descriptionAm":"ጋልቫናይዝድ ብረት ኬብል ትሪ 100x50ሚሜ","unit":"ml","price":"1,850.00"}
+      ]
+    },
+    {
+      "id": "M11",
+      "title": "PAINTS & COATINGS",
+      "titleAm": "ቀለሞች እና ሽፋኖች",
+      "items": [
+        {"code":"M11.1","description":"Plastic emulsion paint (interior) — 20lt","descriptionAm":"ፕላስቲክ ኢሙልሽን ቀለም (የውስጥ) — 20lt","unit":"can","price":"3,200.00"},
+        {"code":"M11.2","description":"Plastic emulsion paint (exterior) — 20lt","descriptionAm":"ፕላስቲክ ኢሙልሽን ቀለም (የውጭ) — 20lt","unit":"can","price":"3,800.00"},
+        {"code":"M11.3","description":"Acrylic emulsion paint (JOTUN) — 20lt","descriptionAm":"አክሬሊክ ኢሙልሽን ቀለም (JOTUN) — 20lt","unit":"can","price":"5,500.00"},
+        {"code":"M11.4","description":"Synthetic enamel paint (oil-based) — 20lt","descriptionAm":"ሲንቴቲክ ኢናሜል ቀለም (በዘይት ላይ የተመሠረተ) — 20lt","unit":"can","price":"4,800.00"},
+        {"code":"M11.5","description":"Varnish (clear) — 20lt","descriptionAm":"ቫርኒሽ (ግልጽ) — 20lt","unit":"can","price":"4,200.00"},
+        {"code":"M11.6","description":"Primer (PVA) — 20lt","descriptionAm":"ፕራይመር (PVA) — 20lt","unit":"can","price":"2,800.00"},
+        {"code":"M11.7","description":"Anti-rust paint (red oxide) — 20lt","descriptionAm":"ዝገት መከላከያ ቀለም (ቀይ ኦክሳይድ) — 20lt","unit":"can","price":"3,500.00"},
+        {"code":"M11.8","description":"Mica paint — 20lt","descriptionAm":"ሚካ ቀለም — 20lt","unit":"can","price":"4,500.00"},
+        {"code":"M11.9","description":"Quartz paint — 20lt","descriptionAm":"ኳርትዝ ቀለም — 20lt","unit":"can","price":"6,800.00"},
+        {"code":"M11.10","description":"Lime paint — 20lt","descriptionAm":"የኖራ ቀለም — 20lt","unit":"can","price":"1,800.00"},
+        {"code":"M11.11","description":"Cement paint — 20lt","descriptionAm":"የሲሚንቶ ቀለም — 20lt","unit":"can","price":"2,200.00"},
+        {"code":"M11.12","description":"Granite paint (textured) — 20lt","descriptionAm":"የግራናይት ቀለም (ቴክስቸርድ) — 20lt","unit":"can","price":"8,500.00"},
+        {"code":"M11.13","description":"Texture paint (Texura Sparol) — 20lt","descriptionAm":"ቴክስቸር ቀለም (ቴክሱራ ስፓሮል) — 20lt","unit":"can","price":"7,200.00"},
+        {"code":"M11.14","description":"Thinner (paint) — 5lt","descriptionAm":"ቀለም ማቅለጫ — 5lt","unit":"can","price":"850.00"},
+        {"code":"M11.15","description":"Paint brush 4\"","descriptionAm":"የቀለም ብሩሽ 4\"","unit":"pcs","price":"180.00"},
+        {"code":"M11.16","description":"Paint roller 9\"","descriptionAm":"የቀለም ሮለር 9\"","unit":"pcs","price":"250.00"},
+        {"code":"M11.17","description":"Putty (acrylic) — 20kg","descriptionAm":"ፑቲ (አክሬሊክ) — 20ኪግ","unit":"bag","price":"1,200.00"},
+        {"code":"M11.18","description":"Waterproof coating (cementitious) — 20kg","descriptionAm":"የውሃ መከላከያ ሽፋን (ሲሚንቶ) — 20ኪግ","unit":"bag","price":"2,400.00"},
+        {"code":"M11.19","description":"Polyurethane waterproof coating — 20lt","descriptionAm":"ፖሊዩሪቴን የውሃ መከላከያ ሽፋን — 20lt","unit":"can","price":"6,500.00"},
+        {"code":"M11.20","description":"Bitumen waterproof membrane 4mm — 1x10m roll","descriptionAm":"ቢቱመን የውሃ መከላከያ ሽፋን 4ሚሜ — 1x10ሜ ጥቅል","unit":"roll","price":"3,800.00"}
+      ]
+    },
+    {
+      "id": "M12",
+      "title": "TILES, STONES & FINISHING MATERIALS",
+      "titleAm": "ታይሎች፣ ድንጋዮች እና የማጠናቀቂያ ቁሳቁሶች",
+      "items": [
+        {"code":"M12.1","description":"Ceramic floor tile 40x40cm (local)","descriptionAm":"የሴራሚክ ወለል ታይል 40x40ሴንቲ ሜትር (የአገር ውስጥ)","unit":"m²","price":"850.00"},
+        {"code":"M12.2","description":"Ceramic floor tile 60x60cm (local)","descriptionAm":"የሴራሚክ ወለል ታይል 60x60ሴንቲ ሜትር (የአገር ውስጥ)","unit":"m²","price":"1,250.00"},
+        {"code":"M12.3","description":"Porcelain floor tile 60x60cm","descriptionAm":"የፖርሴሌን ወለል ታይል 60x60ሴንቲ ሜትር","unit":"m²","price":"1,850.00"},
+        {"code":"M12.4","description":"Porcelain floor tile 120x60cm","descriptionAm":"የፖርሴሌን ወለል ታይል 120x60ሴንቲ ሜትር","unit":"m²","price":"2,600.00"},
+        {"code":"M12.5","description":"Ceramic wall tile 25x40cm (local)","descriptionAm":"የሴራሚክ ግድግዳ ታይል 25x40ሴንቲ ሜትር (የአገር ውስጥ)","unit":"m²","price":"720.00"},
+        {"code":"M12.6","description":"Ceramic wall tile 30x60cm (imported)","descriptionAm":"የሴራሚክ ግድግዳ ታይል 30x60ሴንቲ ሜትር (ከውጭ የመጣ)","unit":"m²","price":"1,450.00"},
+        {"code":"M12.7","description":"Terrazzo tile 40x40x4cm","descriptionAm":"የተራዞ ታይል 40x40x4ሴንቲ ሜትር","unit":"m²","price":"1,100.00"},
+        {"code":"M12.8","description":"Marble slab 2cm thick (local)","descriptionAm":"የእርስ ሰሌዳ 2ሴንቲ ሜትር ውፍረት (የአገር ውስጥ)","unit":"m²","price":"4,200.00"},
+        {"code":"M12.9","description":"Granite slab 2cm thick (local)","descriptionAm":"የግራናይት ሰሌዳ 2ሴንቲ ሜትር ውፍረት (የአገር ውስጥ)","unit":"m²","price":"4,800.00"},
+        {"code":"M12.10","description":"Black Galaxy granite 2cm (imported)","descriptionAm":"ብላክ ጋላክሲ ግራናይት 2ሴንቲ ሜትር (ከውጭ የመጣ)","unit":"m²","price":"12,500.00"},
+        {"code":"M12.11","description":"PVC floor tile 2mm thick","descriptionAm":"PVC ወለል ታይል 2ሚሜ ውፍረት","unit":"m²","price":"950.00"},
+        {"code":"M12.12","description":"SPC flooring 4mm thick","descriptionAm":"SPC ወለል 4ሚሜ ውፍረት","unit":"m²","price":"1,650.00"},
+        {"code":"M12.13","description":"Parquet flooring (Tid)","descriptionAm":"የፓርኬት ወለል (ጽድ)","unit":"m²","price":"2,400.00"},
+        {"code":"M12.14","description":"Tile adhesive powder — 25kg bag","descriptionAm":"የታይል አጣቢ ዱቄት — 25ኪግ ከረጢት","unit":"bag","price":"950.00"},
+        {"code":"M12.15","description":"Tile grout (white cement based) — 5kg","descriptionAm":"የታይል ግሩት (በነጭ ሲሚንቶ ላይ የተመሠረተ) — 5ኪግ","unit":"bag","price":"480.00"},
+        {"code":"M12.16","description":"Silicone sealant (clear) — 300ml","descriptionAm":"ሲሊኮን ማሸጊያ (ግልጽ) — 300ml","unit":"cartridge","price":"380.00"},
+        {"code":"M12.17","description":"Aluminium cladding panel 4mm (silver)","descriptionAm":"የአሉሚኒየም ሽፋን ፓነል 4ሚሜ (ብርማ)","unit":"m²","price":"2,850.00"},
+        {"code":"M12.18","description":"Aluminium cladding panel 4mm (golden)","descriptionAm":"የአሉሚኒየም ሽፋን ፓነል 4ሚሜ (ወርቃማ)","unit":"m²","price":"3,200.00"}
+      ]
+    },
+    {
+      "id": "M13",
+      "title": "GLASS & GLAZING MATERIALS",
+      "titleAm": "ብርጭቆ እና የመስታወት ቁሳቁሶች",
+      "items": [
+        {"code":"M13.1","description":"Clear glass 3mm thick","descriptionAm":"ግልጽ ብርጭቆ 3ሚሜ ውፍረት","unit":"m²","price":"850.00"},
+        {"code":"M13.2","description":"Clear glass 4mm thick","descriptionAm":"ግልጽ ብርጭቆ 4ሚሜ ውፍረት","unit":"m²","price":"1,100.00"},
+        {"code":"M13.3","description":"Clear glass 5mm thick","descriptionAm":"ግልጽ ብርጭቆ 5ሚሜ ውፍረት","unit":"m²","price":"1,450.00"},
+        {"code":"M13.4","description":"Clear glass 6mm thick","descriptionAm":"ግልጽ ብርጭቆ 6ሚሜ ውፍረት","unit":"m²","price":"1,850.00"},
+        {"code":"M13.5","description":"Figured glass 4mm thick","descriptionAm":"ፊገርድ ብርጭቆ 4ሚሜ ውፍረት","unit":"m²","price":"1,650.00"},
+        {"code":"M13.6","description":"Frosted glass 5mm thick","descriptionAm":"ፍርስትድ ብርጭቆ 5ሚሜ ውፍረት","unit":"m²","price":"2,100.00"},
+        {"code":"M13.7","description":"Tinted glass 6mm thick","descriptionAm":"ቲንትድ ብርጭቆ 6ሚሜ ውፍረት","unit":"m²","price":"2,400.00"},
+        {"code":"M13.8","description":"Reflected glass 5mm thick","descriptionAm":"ሪፍሌክትድ ብርጭቆ 5ሚሜ ውፍረት","unit":"m²","price":"2,250.00"},
+        {"code":"M13.9","description":"Laminated (security) glass 6mm","descriptionAm":"ላሚኔትድ (ሴኪዩሪቲ) ብርጭቆ 6ሚሜ","unit":"m²","price":"3,400.00"},
+        {"code":"M13.10","description":"Tempered glass 10mm thick","descriptionAm":"ተምፐርድ ብርጭቆ 10ሚሜ ውፍረት","unit":"m²","price":"4,500.00"},
+        {"code":"M13.11","description":"Wired glass 5mm thick","descriptionAm":"ዋየርድ ብርጭቆ 5ሚሜ ውፍረት","unit":"m²","price":"2,800.00"},
+        {"code":"M13.12","description":"Glass putty (glazing) — 1kg","descriptionAm":"የብርጭቆ ፑቲ (ግሌዚንግ) — 1ኪግ","unit":"kg","price":"220.00"}
+      ]
+    },
+    {
+      "id": "M14",
+      "title": "DOORS, WINDOWS & HARDWARE",
+      "titleAm": "በሮች፣ መስኮቶች እና ሃርድዌር",
+      "items": [
+        {"code":"M14.1","description":"Flush wooden door 40mm (mahogany plywood) — complete","descriptionAm":"ፍላሽ የእንጨት በር 40ሚሜ (ማሆጋኒ ፕላይዉድ) — ሙሉ","unit":"m²","price":"8,500.00"},
+        {"code":"M14.2","description":"Wooden door 40mm (MDF, imported) — complete","descriptionAm":"የእንጨት በር 40ሚሜ (MDF፣ ከውጭ የመጣ) — ሙሉ","unit":"m²","price":"9,800.00"},
+        {"code":"M14.3","description":"PVC door (interior/exterior) — complete","descriptionAm":"PVC በር (የውስጥ/የውጭ) — ሙሉ","unit":"m²","price":"7,200.00"},
+        {"code":"M14.4","description":"HPL door with stainless steel frame — complete","descriptionAm":"HPL በር ከስቴንሌስ ስቲል ፍሬም ጋር — ሙሉ","unit":"m²","price":"11,500.00"},
+        {"code":"M14.5","description":"Metal door 38mm LTZ (1.5mm) — fully metal","descriptionAm":"የብረት በር 38ሚሜ LTZ (1.5ሚሜ) — ሙሉ ብረት","unit":"m²","price":"4,200.00"},
+        {"code":"M14.6","description":"Metal door 38mm LTZ (1.5mm) — partially glazed","descriptionAm":"የብረት በር 38ሚሜ LTZ (1.5ሚሜ) — በከፊል ብርጭቆ","unit":"m²","price":"4,000.00"},
+        {"code":"M14.7","description":"Metal window 38LTZ (1.5mm) — without grill","descriptionAm":"የብረት መስኮት 38LTZ (1.5ሚሜ) — ግሪል የለም","unit":"m²","price":"3,600.00"},
+        {"code":"M14.8","description":"Aluminium window 1.6mm frame + 6mm clear glass","descriptionAm":"የአሉሚኒየም መስኮት 1.6ሚሜ ፍሬም + 6ሚሜ ግልጽ ብርጭቆ","unit":"m²","price":"9,500.00"},
+        {"code":"M14.9","description":"Aluminium door 1.6mm frame + 6mm clear glass","descriptionAm":"የአሉሚኒየም በር 1.6ሚሜ ፍሬም + 6ሚሜ ግልጽ ብርጭቆ","unit":"m²","price":"10,200.00"},
+        {"code":"M14.10","description":"Aluminium curtain wall 1.6mm + 6mm clear glass","descriptionAm":"የአሉሚኒየም መጋረጃ ግድግዳ 1.6ሚሜ + 6ሚሜ ግልጽ ብርጭቆ","unit":"m²","price":"12,800.00"},
+        {"code":"M14.11","description":"Door lock (cylindrical, mortise)","descriptionAm":"የበር መቆለፊያ (ሲሊንደሪካል፣ ሞርታይዝ)","unit":"pcs","price":"1,250.00"},
+        {"code":"M14.12","description":"Door handle (lever type, chrome)","descriptionAm":"የበር መያዣ (ሊቨር ዓይነት፣ ክሮም)","unit":"pcs","price":"650.00"},
+        {"code":"M14.13","description":"Door hinge 4\" (pair)","descriptionAm":"የበር ማጠፊያ 4\" (ጥንድ)","unit":"pair","price":"280.00"},
+        {"code":"M14.14","description":"Door stopper","descriptionAm":"የበር ማቆሚያ","unit":"pcs","price":"120.00"},
+        {"code":"M14.15","description":"Window handle (aluminium)","descriptionAm":"የመስኮት መያዣ (አሉሚኒየም)","unit":"pcs","price":"180.00"},
+        {"code":"M14.16","description":"Tower bolt 6\"","descriptionAm":"ታወር ቦልት 6\"","unit":"pcs","price":"220.00"}
+      ]
+    },
+    {
+      "id": "M15",
+      "title": "WATERPROOFING & CHEMICALS",
+      "titleAm": "የውሃ መከላከያ እና ኬሚካሎች",
+      "items": [
+        {"code":"M15.1","description":"Cementitious waterproof coating — 20kg","descriptionAm":"ሲሚንቶ የውሃ መከላከያ ሽፋን — 20ኪግ","unit":"bag","price":"2,400.00"},
+        {"code":"M15.2","description":"Xypex crystalline waterproof — 25kg","descriptionAm":"Xypex ክሪስታላይን የውሃ መከላከያ — 25ኪግ","unit":"bag","price":"4,800.00"},
+        {"code":"M15.3","description":"Polyurethane waterproof coating — 20lt","descriptionAm":"ፖሊዩሪቴን የውሃ መከላከያ ሽፋን — 20lt","unit":"can","price":"6,500.00"},
+        {"code":"M15.4","description":"Bitumen waterproof membrane 4mm — roll","descriptionAm":"ቢቱመን የውሃ መከላከያ ሽፋን 4ሚሜ — ጥቅል","unit":"roll","price":"3,800.00"},
+        {"code":"M15.5","description":"PVC waterstop 200mm — 25m roll","descriptionAm":"PVC የውሃ ማቆሚያ 200ሚሜ — 25ሜ ጥቅል","unit":"roll","price":"4,500.00"},
+        {"code":"M15.6","description":"PVC joint filler 10mm — 50m roll","descriptionAm":"PVC መገጣጠሚያ መሙያ 10ሚሜ — 50ሜ ጥቅል","unit":"roll","price":"2,800.00"},
+        {"code":"M15.7","description":"Concrete admixture (plasticizer) — 20lt","descriptionAm":"የኮንክሪት ተጨማሪ (ፕላስቲሳይዘር) — 20lt","unit":"can","price":"3,200.00"},
+        {"code":"M15.8","description":"Concrete admixture (waterproof) — 20lt","descriptionAm":"የኮንክሪት ተጨማሪ (የውሃ መከላከያ) — 20lt","unit":"can","price":"3,800.00"},
+        {"code":"M15.9","description":"Concrete admixture (accelerator) — 20lt","descriptionAm":"የኮንክሪት ተጨማሪ (አፋጣኝ) — 20lt","unit":"can","price":"3,500.00"},
+        {"code":"M15.10","description":"Concrete admixture (retarder) — 20lt","descriptionAm":"የኮንክሪት ተጨማሪ (አዘግይ) — 20lt","unit":"can","price":"3,500.00"},
+        {"code":"M15.11","description":"Form release agent (oil) — 20lt","descriptionAm":"የፎርም መለቀቂያ ወኪል (ዘይት) — 20lt","unit":"can","price":"2,200.00"},
+        {"code":"M15.12","description":"Curing compound — 20lt","descriptionAm":"የኮንክሪት እርጥበት መጠበቂያ — 20lt","unit":"can","price":"2,800.00"},
+        {"code":"M15.13","description":"Epoxy resin (2-part) — 5kg kit","descriptionAm":"ኤፖክሲ ሬዚን (2-ክፍል) — 5ኪግ ኪት","unit":"kit","price":"4,500.00"},
+        {"code":"M15.14","description":"Epoxy floor topping — 20kg kit","descriptionAm":"ኤፖክሲ ወለል ሽፋን — 20ኪግ ኪት","unit":"kit","price":"12,500.00"},
+        {"code":"M15.15","description":"Anti-termite chemical — 20lt","descriptionAm":"ጸረ-ምስጥ ኬሚካል — 20lt","unit":"can","price":"3,800.00"}
+      ]
+    }
+  ]
+
+};END
 cat > src/data/pricing.js << 'END'
 const round2 = (n) => Math.round(n * 100) / 100;
 export function tierPrice(product, qty) {
@@ -2199,151 +3498,153 @@ export const RATEBOOK = {
   "document": "file.pdf",
   "source": "Addis Ababa Design and Construction Works Bureau",
   "quarter": "2018 4th Quarter (Direct Cost Only)",
-  "currency": "ETB",    
-"categories": [
+  "currency": "ETB",
+  "categories": [
     {
       "id": "1",
       "title": "DEMOLITION WORK",
+      "titleAm": "የማፍረስ ሥራ",
       "items": [
-        {"page":6,"code":"1.1.1","description":"Demolishing the lamera wall","unit":"m²","price":"172.41"},
-        {"page":6,"code":"1.1.2","description":"Demolishing the existing CIS wall","unit":"m²","price":"32.33"},
-        {"page":6,"code":"1.1.3","description":"Demolishing of wooden wall","unit":"m²","price":"182.53"},
-        {"page":6,"code":"1.1.4","description":"Demolishing of gypsum wall","unit":"m²","price":"91.27"},
-        {"page":6,"code":"1.1.5","description":"Demolishing the CIS roof","unit":"m²","price":"51.72"},
-        {"page":6,"code":"1.1.6","description":"Demolishing of 7x5 cm zigba purline","unit":"ml","price":"25.86"},
-        {"page":6,"code":"1.1.7","description":"Demolishing of eucalyptus upper & lower chords","unit":"ml","price":"79.91"},
-        {"page":6,"code":"1.1.8","description":"Dimolish RHS purline","unit":"ml","price":"43.10"},
-        {"page":6,"code":"1.1.9","description":"Dimolishing the RHS truss.","unit":"ml","price":"103.01"},
-        {"page":6,"code":"1.1.10","description":"Desmantling Gutter","unit":"ml","price":"34.30"},
-        {"page":6,"code":"1.1.11","description":"Desmantling down pipe","unit":"ml","price":"69.82"},
-        {"page":6,"code":"1.1.12","description":"Demolishing the chipwood ceiling","unit":"m²","price":"119.56"},
-        {"page":6,"code":"1.1.13","description":"Demolishing the timber ceiling","unit":"m²","price":"166.06"},
-        {"page":6,"code":"1.1.14","description":"Demolishing the abujed ceiling","unit":"m²","price":"41.51"},
-        {"page":6,"code":"1.1.15","description":"Dismantle the metal doors from the wall.","unit":"m²","price":"169.07"},
-        {"page":6,"code":"1.1.16","description":"Dismantle the metal windows from the wall.","unit":"m²","price":"152.16"},
-        {"page":6,"code":"1.1.17","description":"Desmantling fascia board","unit":"ml","price":"47.65"},
-        {"page":6,"code":"1.1.18","description":"Desmantling ridge & copping","unit":"ml","price":"68.60"},
-        {"page":6,"code":"1.1.19","description":"Demolishing the PVC floor tile","unit":"m²","price":"45.63"},
-        {"page":6,"code":"1.1.20","description":"Demolishing kitchen sink","unit":"pcs","price":"70.46"},
-        {"page":6,"code":"1.1.21","description":"Demolishing toilet WC,HW,turkish seat","unit":"pcs","price":"211.37"},
-        {"page":6,"code":"1.1.22","description":"Desmantling of wooden door & window","unit":"m²","price":"135.47"},
-        {"page":6,"code":"1.2.1","description":"Masonary Structure (BGL)","unit":"m³","price":"580.90"},
-        {"page":6,"code":"1.2.2","description":"Masonary Structure (AGL)","unit":"m³","price":"774.54"},
-        {"page":6,"code":"1.2.3","description":"Demolishing of 25cm thick hardcore","unit":"m²","price":"54.56"},
-        {"page":6,"code":"1.2.4","description":"Concrete Structures","unit":"m³","price":"2,580.74"},
-        {"page":6,"code":"1.2.5","description":"10cm thick HCB Structure","unit":"m²","price":"55.46"},
-        {"page":6,"code":"1.2.6","description":"15cm thick HCB Structure","unit":"m²","price":"73.61"},
-        {"page":7,"code":"1.2.7","description":"20cm thick HCB Structure","unit":"m²","price":"103.06"},
-        {"page":7,"code":"1.2.8","description":"Terrazzo floor","unit":"m²","price":"114.51"},
-        {"page":7,"code":"1.2.9","description":"Cement screed floor","unit":"m²","price":"25.77"},
-        {"page":7,"code":"1.2.10","description":"8cm thick Mass concrete floor","unit":"m²","price":"34.35"},
-        {"page":7,"code":"1.2.11","description":"30x120x3cm thick marble tread","unit":"pcs","price":"227.83"},
-        {"page":7,"code":"1.2.12","description":"15x120x3cm thick marble riser","unit":"pcs","price":"170.87"},
-        {"page":7,"code":"1.2.13","description":"Steel Structure","unit":"Kg","price":"10.61"},
-        {"page":7,"code":"1.2.14","description":"Demolishing the ceramic wall tile","unit":"m²","price":"114.51"},
-        {"page":7,"code":"1.2.15","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 1st–3rd floor","unit":"m²","price":"128.83"},
-        {"page":7,"code":"1.2.16","description":"Concrete Structures","unit":"m³","price":"3,236.74"},
-        {"page":7,"code":"1.2.17","description":"10cm thick HCB Structure","unit":"m²","price":"78.23"},
-        {"page":7,"code":"1.2.18","description":"15cm thick HCB Structure","unit":"m²","price":"100.59"},
-        {"page":7,"code":"1.2.19","description":"20cm thick HCB Structure","unit":"m²","price":"140.82"},
-        {"page":7,"code":"1.2.20","description":"Terrazzo floor","unit":"m²","price":"150.07"},
-        {"page":7,"code":"1.2.21","description":"Cement screed floor","unit":"m²","price":"33.77"},
-        {"page":7,"code":"1.2.22","description":"30x120x3cm thick marble tread","unit":"m²","price":"281.17"},
-        {"page":7,"code":"1.2.23","description":"15x120x3cm marble riser","unit":"m²","price":"210.87"},
-        {"page":7,"code":"1.2.24","description":"Steel Structure","unit":"kg","price":"13.11"},
-        {"page":7,"code":"1.2.25","description":"Demolishing the ceramic wall tile","unit":"m²","price":"150.07"},
-        {"page":7,"code":"1.2.26","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 4th–7th floor","unit":"m²","price":"168.83"},
-        {"page":7,"code":"1.2.27","description":"Concrete Structures","unit":"m³","price":"4,036.74"},
-        {"page":7,"code":"1.2.28","description":"10cm thick HCB Structure","unit":"m²","price":"80.82"},
-        {"page":7,"code":"1.2.29","description":"15cm thick HCB Structure","unit":"m²","price":"103.91"},
-        {"page":7,"code":"1.2.30","description":"20cm thick HCB Structure","unit":"m²","price":"145.47"},
-        {"page":7,"code":"1.2.31","description":"Terrazzo floor","unit":"m²","price":"161.63"},
-        {"page":7,"code":"1.2.32","description":"Cement screed floor","unit":"m²","price":"36.37"},
-        {"page":7,"code":"1.2.33","description":"30x120x3cm thick marble tread","unit":"m²","price":"324.90"},
-        {"page":7,"code":"1.2.34","description":"15x120x3cm marble riser","unit":"m²","price":"243.67"},
-        {"page":7,"code":"1.2.35","description":"Steel Structure","unit":"kg","price":"19.32"},
-        {"page":8,"code":"1.2.36","description":"Demolishing the ceramic wall tile","unit":"m²","price":"185.62"},
-        {"page":8,"code":"1.2.37","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 8th–12th floor","unit":"m²","price":"208.83"},
-        {"page":8,"code":"1.2.38","description":"Concrete Structures","unit":"m³","price":"4,836.74"},
-        {"page":8,"code":"1.2.39","description":"10cm thick HCB Structure","unit":"m²","price":"115.36"},
-        {"page":8,"code":"1.2.40","description":"15cm thick HCB Structure","unit":"m²","price":"126.76"},
-        {"page":8,"code":"1.2.41","description":"20cm thick HCB Structure","unit":"m²","price":"177.47"},
-        {"page":8,"code":"1.2.42","description":"Terrazzo floor","unit":"m²","price":"197.19"},
-        {"page":8,"code":"1.2.43","description":"Cement screed floor","unit":"m²","price":"44.37"},
-        {"page":8,"code":"1.2.44","description":"30x120x3cm thick marble tread","unit":"m²","price":"378.23"},
-        {"page":8,"code":"1.2.45","description":"15x120x3cm marble riser","unit":"pcs","price":"283.67"},
-        {"page":8,"code":"1.2.46","description":"Steel Structure","unit":"kg","price":"19.01"},
-        {"page":8,"code":"1.2.47","description":"Demolishing the ceramic wall tile","unit":"m²","price":"221.18"},
-        {"page":8,"code":"1.2.48","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 13th–20th floor","unit":"m²","price":"248.83"},
-        {"page":8,"code":"1.2.49","description":"Concrete Structures","unit":"m³","price":"5,636.74"},
-        {"page":8,"code":"1.2.50","description":"10cm thick HCB Structure","unit":"m²","price":"116.37"},
-        {"page":8,"code":"1.2.51","description":"15cm thick HCB Structure","unit":"m²","price":"149.62"},
-        {"page":8,"code":"1.2.52","description":"20cm thick HCB Structure","unit":"m²","price":"209.47"},
-        {"page":8,"code":"1.2.53","description":"Terrazzo floor","unit":"m²","price":"232.74"},
-        {"page":8,"code":"1.2.54","description":"Cement screed floor","unit":"m²","price":"52.37"},
-        {"page":8,"code":"1.2.55","description":"30x120x3cm thick marble tread","unit":"m²","price":"431.57"},
-        {"page":8,"code":"1.2.56","description":"15x120x3cm marble riser","unit":"pcs","price":"323.67"},
-        {"page":8,"code":"1.2.57","description":"Steel Structure","unit":"kg","price":"21.51"},
-        {"page":8,"code":"1.2.58","description":"Demolishing the ceramic wall tile","unit":"m²","price":"256.73"}
+        {"page":6,"code":"1.1.1","description":"Demolishing the lamera wall","descriptionAm":"የላሜራ ግድግዳ ማፍረስ","unit":"m²","price":"172.41"},
+        {"page":6,"code":"1.1.2","description":"Demolishing the existing CIS wall","descriptionAm":"ነባሩ የCIS ግድግዳ ማፍረስ","unit":"m²","price":"32.33"},
+        {"page":6,"code":"1.1.3","description":"Demolishing of wooden wall","descriptionAm":"የእንጨት ግድግዳ ማፍረስ","unit":"m²","price":"182.53"},
+        {"page":6,"code":"1.1.4","description":"Demolishing of gypsum wall","descriptionAm":"የጂፕሰም ግድግዳ ማፍረስ","unit":"m²","price":"91.27"},
+        {"page":6,"code":"1.1.5","description":"Demolishing the CIS roof","descriptionAm":"የCIS ጣሪያ ማፍረስ","unit":"m²","price":"51.72"},
+        {"page":6,"code":"1.1.6","description":"Demolishing of 7x5 cm zigba purline","descriptionAm":"7x5 ሴንቲ ሜትር ዚግባ ፐርላይን ማፍረስ","unit":"ml","price":"25.86"},
+        {"page":6,"code":"1.1.7","description":"Demolishing of eucalyptus upper & lower chords","descriptionAm":"የባህር ዛፍ የላይኛው እና የታችኛው ቾርድ ማፍረስ","unit":"ml","price":"79.91"},
+        {"page":6,"code":"1.1.8","description":"Dimolish RHS purline","descriptionAm":"RHS ፐርላይን ማፍረስ","unit":"ml","price":"43.10"},
+        {"page":6,"code":"1.1.9","description":"Dimolishing the RHS truss.","descriptionAm":"የRHS ትረስ ማፍረስ።","unit":"ml","price":"103.01"},
+        {"page":6,"code":"1.1.10","description":"Desmantling Gutter","descriptionAm":"የውሃ ማስተላለፊያ ቦይ ማፍረስ","unit":"ml","price":"34.30"},
+        {"page":6,"code":"1.1.11","description":"Desmantling down pipe","descriptionAm":"የውሃ ማውረጃ ቧንቧ ማፍረስ","unit":"ml","price":"69.82"},
+        {"page":6,"code":"1.1.12","description":"Demolishing the chipwood ceiling","descriptionAm":"የቺፕዉድ ጣሪያ ማፍረስ","unit":"m²","price":"119.56"},
+        {"page":6,"code":"1.1.13","description":"Demolishing the timber ceiling","descriptionAm":"የእንጨት ጣሪያ ማፍረስ","unit":"m²","price":"166.06"},
+        {"page":6,"code":"1.1.14","description":"Demolishing the abujed ceiling","descriptionAm":"የአቡጄድ ጣሪያ ማፍረስ","unit":"m²","price":"41.51"},
+        {"page":6,"code":"1.1.15","description":"Dismantle the metal doors from the wall.","descriptionAm":"የብረት በሮችን ከግድግዳ ላይ መፍታት።","unit":"m²","price":"169.07"},
+        {"page":6,"code":"1.1.16","description":"Dismantle the metal windows from the wall.","descriptionAm":"የብረት መስኮቶችን ከግድግዳ ላይ መፍታት።","unit":"m²","price":"152.16"},
+        {"page":6,"code":"1.1.17","description":"Desmantling fascia board","descriptionAm":"የፋሺያ ቦርድ ማፍረስ","unit":"ml","price":"47.65"},
+        {"page":6,"code":"1.1.18","description":"Desmantling ridge & copping","descriptionAm":"የጣሪያ ሪጅ እና ኮፒንግ ማፍረስ","unit":"ml","price":"68.60"},
+        {"page":6,"code":"1.1.19","description":"Demolishing the PVC floor tile","descriptionAm":"የPVC ወለል ታይል ማፍረስ","unit":"m²","price":"45.63"},
+        {"page":6,"code":"1.1.20","description":"Demolishing kitchen sink","descriptionAm":"የወጥ ቤት ማጠቢያ ማፍረስ","unit":"pcs","price":"70.46"},
+        {"page":6,"code":"1.1.21","description":"Demolishing toilet WC,HW,turkish seat","descriptionAm":"የሽንኩርት ቤት WC፣ HW፣ የቱርክ መቀመጫ ማፍረስ","unit":"pcs","price":"211.37"},
+        {"page":6,"code":"1.1.22","description":"Desmantling of wooden door & window","descriptionAm":"የእንጨት በር እና መስኮት ማፍረስ","unit":"m²","price":"135.47"},
+        {"page":6,"code":"1.2.1","description":"Masonary Structure (BGL)","descriptionAm":"የግንበኝነት መዋቅር (BGL)","unit":"m³","price":"580.90"},
+        {"page":6,"code":"1.2.2","description":"Masonary Structure (AGL)","descriptionAm":"የግንበኝነት መዋቅር (AGL)","unit":"m³","price":"774.54"},
+        {"page":6,"code":"1.2.3","description":"Demolishing of 25cm thick hardcore","descriptionAm":"25 ሴንቲ ሜትር ውፍረት ያለው ሃርድኮር ማፍረስ","unit":"m²","price":"54.56"},
+        {"page":6,"code":"1.2.4","description":"Concrete Structures","descriptionAm":"የኮንክሪት መዋቅሮች","unit":"m³","price":"2,580.74"},
+        {"page":6,"code":"1.2.5","description":"10cm thick HCB Structure","descriptionAm":"10 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"55.46"},
+        {"page":6,"code":"1.2.6","description":"15cm thick HCB Structure","descriptionAm":"15 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"73.61"},
+        {"page":7,"code":"1.2.7","description":"20cm thick HCB Structure","descriptionAm":"20 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"103.06"},
+        {"page":7,"code":"1.2.8","description":"Terrazzo floor","descriptionAm":"የተራዞ ወለል","unit":"m²","price":"114.51"},
+        {"page":7,"code":"1.2.9","description":"Cement screed floor","descriptionAm":"የሲሚንቶ ስክሪድ ወለል","unit":"m²","price":"25.77"},
+        {"page":7,"code":"1.2.10","description":"8cm thick Mass concrete floor","descriptionAm":"8 ሴንቲ ሜትር ውፍረት ያለው ማስ ኮንክሪት ወለል","unit":"m²","price":"34.35"},
+        {"page":7,"code":"1.2.11","description":"30x120x3cm thick marble tread","descriptionAm":"30x120x3 ሴንቲ ሜትር ውፍረት ያለው የእርስ ተርድ","unit":"pcs","price":"227.83"},
+        {"page":7,"code":"1.2.12","description":"15x120x3cm thick marble riser","descriptionAm":"15x120x3 ሴንቲ ሜትር ውፍረት ያለው የእርስ ራይዘር","unit":"pcs","price":"170.87"},
+        {"page":7,"code":"1.2.13","description":"Steel Structure","descriptionAm":"የብረት መዋቅር","unit":"Kg","price":"10.61"},
+        {"page":7,"code":"1.2.14","description":"Demolishing the ceramic wall tile","descriptionAm":"የሴራሚክ ግድግዳ ታይል ማፍረስ","unit":"m²","price":"114.51"},
+        {"page":7,"code":"1.2.15","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 1st–3rd floor","descriptionAm":"የሴራሚክ ወለል ታይል (6 እና 8 ሚሜ ውፍረት) ማፍረስ — 1ኛ–3ኛ ፎቅ","unit":"m²","price":"128.83"},
+        {"page":7,"code":"1.2.16","description":"Concrete Structures","descriptionAm":"የኮንክሪት መዋቅሮች","unit":"m³","price":"3,236.74"},
+        {"page":7,"code":"1.2.17","description":"10cm thick HCB Structure","descriptionAm":"10 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"78.23"},
+        {"page":7,"code":"1.2.18","description":"15cm thick HCB Structure","descriptionAm":"15 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"100.59"},
+        {"page":7,"code":"1.2.19","description":"20cm thick HCB Structure","descriptionAm":"20 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"140.82"},
+        {"page":7,"code":"1.2.20","description":"Terrazzo floor","descriptionAm":"የተራዞ ወለል","unit":"m²","price":"150.07"},
+        {"page":7,"code":"1.2.21","description":"Cement screed floor","descriptionAm":"የሲሚንቶ ስክሪድ ወለል","unit":"m²","price":"33.77"},
+        {"page":7,"code":"1.2.22","description":"30x120x3cm thick marble tread","descriptionAm":"30x120x3 ሴንቲ ሜትር ውፍረት ያለው የእርስ ተርድ","unit":"m²","price":"281.17"},
+        {"page":7,"code":"1.2.23","description":"15x120x3cm marble riser","descriptionAm":"15x120x3 ሴንቲ ሜትር የእርስ ራይዘር","unit":"m²","price":"210.87"},
+        {"page":7,"code":"1.2.24","description":"Steel Structure","descriptionAm":"የብረት መዋቅር","unit":"kg","price":"13.11"},
+        {"page":7,"code":"1.2.25","description":"Demolishing the ceramic wall tile","descriptionAm":"የሴራሚክ ግድግዳ ታይል ማፍረስ","unit":"m²","price":"150.07"},
+        {"page":7,"code":"1.2.26","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 4th–7th floor","descriptionAm":"የሴራሚክ ወለል ታይል (6 እና 8 ሚሜ ውፍረት) ማፍረስ — 4ኛ–7ኛ ፎቅ","unit":"m²","price":"168.83"},
+        {"page":7,"code":"1.2.27","description":"Concrete Structures","descriptionAm":"የኮንክሪት መዋቅሮች","unit":"m³","price":"4,036.74"},
+        {"page":7,"code":"1.2.28","description":"10cm thick HCB Structure","descriptionAm":"10 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"80.82"},
+        {"page":7,"code":"1.2.29","description":"15cm thick HCB Structure","descriptionAm":"15 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"103.91"},
+        {"page":7,"code":"1.2.30","description":"20cm thick HCB Structure","descriptionAm":"20 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"145.47"},
+        {"page":7,"code":"1.2.31","description":"Terrazzo floor","descriptionAm":"የተራዞ ወለል","unit":"m²","price":"161.63"},
+        {"page":7,"code":"1.2.32","description":"Cement screed floor","descriptionAm":"የሲሚንቶ ስክሪድ ወለል","unit":"m²","price":"36.37"},
+        {"page":7,"code":"1.2.33","description":"30x120x3cm thick marble tread","descriptionAm":"30x120x3 ሴንቲ ሜትር ውፍረት ያለው የእርስ ተርድ","unit":"m²","price":"324.90"},
+        {"page":7,"code":"1.2.34","description":"15x120x3cm marble riser","descriptionAm":"15x120x3 ሴንቲ ሜትር የእርስ ራይዘር","unit":"m²","price":"243.67"},
+        {"page":7,"code":"1.2.35","description":"Steel Structure","descriptionAm":"የብረት መዋቅር","unit":"kg","price":"19.32"},
+        {"page":8,"code":"1.2.36","description":"Demolishing the ceramic wall tile","descriptionAm":"የሴራሚክ ግድግዳ ታይል ማፍረስ","unit":"m²","price":"185.62"},
+        {"page":8,"code":"1.2.37","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 8th–12th floor","descriptionAm":"የሴራሚክ ወለል ታይል (6 እና 8 ሚሜ ውፍረት) ማፍረስ — 8ኛ–12ኛ ፎቅ","unit":"m²","price":"208.83"},
+        {"page":8,"code":"1.2.38","description":"Concrete Structures","descriptionAm":"የኮንክሪት መዋቅሮች","unit":"m³","price":"4,836.74"},
+        {"page":8,"code":"1.2.39","description":"10cm thick HCB Structure","descriptionAm":"10 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"115.36"},
+        {"page":8,"code":"1.2.40","description":"15cm thick HCB Structure","descriptionAm":"15 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"126.76"},
+        {"page":8,"code":"1.2.41","description":"20cm thick HCB Structure","descriptionAm":"20 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"177.47"},
+        {"page":8,"code":"1.2.42","description":"Terrazzo floor","descriptionAm":"የተራዞ ወለል","unit":"m²","price":"197.19"},
+        {"page":8,"code":"1.2.43","description":"Cement screed floor","descriptionAm":"የሲሚንቶ ስክሪድ ወለል","unit":"m²","price":"44.37"},
+        {"page":8,"code":"1.2.44","description":"30x120x3cm thick marble tread","descriptionAm":"30x120x3 ሴንቲ ሜትር ውፍረት ያለው የእርስ ተርድ","unit":"m²","price":"378.23"},
+        {"page":8,"code":"1.2.45","description":"15x120x3cm marble riser","descriptionAm":"15x120x3 ሴንቲ ሜትር የእርስ ራይዘር","unit":"pcs","price":"283.67"},
+        {"page":8,"code":"1.2.46","description":"Steel Structure","descriptionAm":"የብረት መዋቅር","unit":"kg","price":"19.01"},
+        {"page":8,"code":"1.2.47","description":"Demolishing the ceramic wall tile","descriptionAm":"የሴራሚክ ግድግዳ ታይል ማፍረስ","unit":"m²","price":"221.18"},
+        {"page":8,"code":"1.2.48","description":"Demolishing the ceramic floor tile (6 & 8 mm thick) — 13th–20th floor","descriptionAm":"የሴራሚክ ወለል ታይል (6 እና 8 ሚሜ ውፍረት) ማፍረስ — 13ኛ–20ኛ ፎቅ","unit":"m²","price":"248.83"},
+        {"page":8,"code":"1.2.49","description":"Concrete Structures","descriptionAm":"የኮንክሪት መዋቅሮች","unit":"m³","price":"5,636.74"},
+        {"page":8,"code":"1.2.50","description":"10cm thick HCB Structure","descriptionAm":"10 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"116.37"},
+        {"page":8,"code":"1.2.51","description":"15cm thick HCB Structure","descriptionAm":"15 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"149.62"},
+        {"page":8,"code":"1.2.52","description":"20cm thick HCB Structure","descriptionAm":"20 ሴንቲ ሜትር ውፍረት ያለው HCB መዋቅር","unit":"m²","price":"209.47"},
+        {"page":8,"code":"1.2.53","description":"Terrazzo floor","descriptionAm":"የተራዞ ወለል","unit":"m²","price":"232.74"},
+        {"page":8,"code":"1.2.54","description":"Cement screed floor","descriptionAm":"የሲሚንቶ ስክሪድ ወለል","unit":"m²","price":"52.37"},
+        {"page":8,"code":"1.2.55","description":"30x120x3cm thick marble tread","descriptionAm":"30x120x3 ሴንቲ ሜትር ውፍረት ያለው የእርስ ተርድ","unit":"m²","price":"431.57"},
+        {"page":8,"code":"1.2.56","description":"15x120x3cm marble riser","descriptionAm":"15x120x3 ሴንቲ ሜትር የእርስ ራይዘር","unit":"pcs","price":"323.67"},
+        {"page":8,"code":"1.2.57","description":"Steel Structure","descriptionAm":"የብረት መዋቅር","unit":"kg","price":"21.51"},
+        {"page":8,"code":"1.2.58","description":"Demolishing the ceramic wall tile","descriptionAm":"የሴራሚክ ግድግዳ ታይል ማፍረስ","unit":"m²","price":"256.73"}
       ]
     },
     {
       "id": "2",
       "title": "EXCAVATION AND EARTH WORK — MECHANIZED",
+      "titleAm": "የቁፋሮ እና የአፈር ሥራ — በማሽን",
       "items": [
-        {"page":8,"code":"2.1.1","description":"20cm. Clearing on wet & black soil.","unit":"m²","price":"98.79"},
-        {"page":8,"code":"2.2.1","description":"Bulk excavation in loose & dry soil — depth not exceeding 1.5m","unit":"m³","price":"368.92"},
-        {"page":8,"code":"2.2.2","description":"Depth 1.50m–3.00m","unit":"m³","price":"452.22"},
-        {"page":8,"code":"2.2.3","description":"Depth 3.00m–4.50m","unit":"m³","price":"547.61"},
-        {"page":9,"code":"2.2.4","description":"Depth 4.50m–6.00m","unit":"m³","price":"625.84"},
-        {"page":9,"code":"2.2.5","description":"Depth 6.00m–7.50m","unit":"m³","price":"730.15"},
-        {"page":9,"code":"2.2.6","description":"Depth 7.50m–9.00m","unit":"m³","price":"876.18"},
-        {"page":9,"code":"2.2.7","description":"Depth 9.00m–10.50m","unit":"m³","price":"973.53"},
-        {"page":9,"code":"2.3.1","description":"Pit excavation in loose & dry soil — depth ≤1500mm","unit":"m³","price":"417.23"},
-        {"page":9,"code":"2.3.2","description":"Depth 1500–3000mm","unit":"m³","price":"476.83"},
-        {"page":9,"code":"2.3.3","description":"Depth 3000–4500mm","unit":"m³","price":"556.30"},
-        {"page":9,"code":"2.3.4","description":"Depth 4500–6000mm","unit":"m³","price":"667.56"},
-        {"page":9,"code":"2.3.5","description":"Depth 6000–7500mm","unit":"m³","price":"834.46"},
-        {"page":9,"code":"2.3.6","description":"Depth 7500–9000mm","unit":"m³","price":"1,054.05"},
-        {"page":9,"code":"2.3.7","description":"Depth 9000–10500mm","unit":"m³","price":"1,430.50"},
-        {"page":9,"code":"2.4.1","description":"Bulk excavation in soft rock — depth ≤1.5m","unit":"m³","price":"666.61"},
-        {"page":9,"code":"2.4.2","description":"Depth 1.5m–3m","unit":"m³","price":"760.13"},
-        {"page":9,"code":"2.4.3","description":"Depth 3.0m–4.5m","unit":"m³","price":"922.70"},
-        {"page":9,"code":"2.4.4","description":"Depth 4.5m–6.0m","unit":"m³","price":"1,318.14"},
-        {"page":9,"code":"2.4.5","description":"Depth 6.0m–7.5m","unit":"m³","price":"1,883.05"},
-        {"page":9,"code":"2.4.6","description":"Depth 7.5m–9.0m","unit":"m³","price":"2,690.08"},
-        {"page":9,"code":"2.4.7","description":"Depth 9.0m–10.5m","unit":"m³","price":"3,842.97"},
-        {"page":9,"code":"2.5.1","description":"Pit excavation in soft rock — depth ≤1.5m","unit":"m³","price":"829.55"},
-        {"page":9,"code":"2.5.2","description":"Depth 1.5m–3m","unit":"m³","price":"911.60"},
-        {"page":9,"code":"2.5.3","description":"Depth 3.0m–4.5m","unit":"m³","price":"1,128.64"},
-        {"page":9,"code":"2.5.4","description":"Depth 4.5m–6m","unit":"m³","price":"1,612.35"},
-        {"page":9,"code":"2.5.5","description":"Depth 6m–7.5m","unit":"m³","price":"2,303.36"},
-        {"page":9,"code":"2.5.6","description":"Depth 7.5m–9m","unit":"m³","price":"3,290.51"},
-        {"page":9,"code":"2.5.7","description":"Depth 9m–10.5m","unit":"m³","price":"4,700.72"},
-        {"page":9,"code":"2.6.1","description":"Bulk excavation in hard rock — depth ≤1.50m","unit":"m³","price":"1,368.24"},
-        {"page":9,"code":"2.6.2","description":"Depth 1.5m–3m","unit":"m³","price":"1,706.63"},
-        {"page":9,"code":"2.6.3","description":"Depth 3.0m–4.5m","unit":"m³","price":"2,051.20"},
-        {"page":10,"code":"2.6.4","description":"Depth 4.5m–6.0m","unit":"m³","price":"2,792.32"},
-        {"page":10,"code":"2.6.5","description":"Depth 6.0m–7.5m","unit":"m³","price":"3,490.40"},
-        {"page":10,"code":"2.6.6","description":"Depth 7.5m–9.0m","unit":"m³","price":"4,363.00"},
-        {"page":10,"code":"2.6.7","description":"Depth 9.0m–10.5m","unit":"m³","price":"5,132.95"},
-        {"page":10,"code":"2.7.1","description":"Pit excavation in hard rock — depth ≤1.50m","unit":"m³","price":"1,659.11"},
-        {"page":10,"code":"2.7.2","description":"Depth 1.5m–3m","unit":"m³","price":"2,051.09"},
-        {"page":10,"code":"2.7.3","description":"Depth 3.0m–4.5m","unit":"m³","price":"2,666.42"},
-        {"page":10,"code":"2.7.4","description":"Depth 4.5m–6m","unit":"m³","price":"3,627.78"},
-        {"page":10,"code":"2.7.5","description":"Depth 6.0m–7.5m","unit":"m³","price":"5,182.55"},
-        {"page":10,"code":"2.7.6","description":"Depth 7.5m–9m","unit":"m³","price":"7,403.64"},
-        {"page":10,"code":"2.7.7","description":"Depth 9m–10.5m","unit":"m³","price":"10,576.63"},
-        {"page":10,"code":"2.8.1","description":"Back fill selected excavated mats. from the site (mechanized)","unit":"m³","price":"982.68"},
-        {"page":10,"code":"2.8.2","description":"Back fill from outside (Upto 20km) (Mechanized)","unit":"m³","price":"3,066.43"},
-        {"page":10,"code":"2.8.3","description":"Back fill from outside (Upto 15km) (Mechanized)","unit":"m³","price":"2,540.36"},
-        {"page":10,"code":"2.8.4","description":"Back fill from outside (Upto 10km) (Mechanized)","unit":"m³","price":"2,180.98"},
-        {"page":10,"code":"2.8.5","description":"Back fill from outside (Upto 5km) (Mechanized)","unit":"m³","price":"1,821.61"},
-        {"page":10,"code":"2.8.6","description":"25cm. thick basaltic hard core. (Mechanized)","unit":"m²","price":"1,099.89"}
+        {"page":8,"code":"2.1.1","description":"20cm. Clearing on wet & black soil.","descriptionAm":"20 ሴንቲ ሜትር። እርጥብ እና ጥቁር አፈር ላይ ማጽዳት።","unit":"m²","price":"98.79"},
+        {"page":8,"code":"2.2.1","description":"Bulk excavation in loose & dry soil — depth not exceeding 1.5m","descriptionAm":"ልቅ እና ደረቅ አፈር ውስጥ በጅምላ ቁፋሮ — ጥልቀት ከ1.5m የማይበልጥ","unit":"m³","price":"368.92"},
+        {"page":8,"code":"2.2.2","description":"Depth 1.50m–3.00m","descriptionAm":"ጥልቀት 1.50m–3.00m","unit":"m³","price":"452.22"},
+        {"page":8,"code":"2.2.3","description":"Depth 3.00m–4.50m","descriptionAm":"ጥልቀት 3.00m–4.50m","unit":"m³","price":"547.61"},
+        {"page":9,"code":"2.2.4","description":"Depth 4.50m–6.00m","descriptionAm":"ጥልቀት 4.50m–6.00m","unit":"m³","price":"625.84"},
+        {"page":9,"code":"2.2.5","description":"Depth 6.00m–7.50m","descriptionAm":"ጥልቀት 6.00m–7.50m","unit":"m³","price":"730.15"},
+        {"page":9,"code":"2.2.6","description":"Depth 7.50m–9.00m","descriptionAm":"ጥልቀት 7.50m–9.00m","unit":"m³","price":"876.18"},
+        {"page":9,"code":"2.2.7","description":"Depth 9.00m–10.50m","descriptionAm":"ጥልቀት 9.00m–10.50m","unit":"m³","price":"973.53"},
+        {"page":9,"code":"2.3.1","description":"Pit excavation in loose & dry soil — depth ≤1500mm","descriptionAm":"ልቅ እና ደረቅ አፈር ውስጥ የጉድጓድ ቁፋሮ — ጥልቀት ≤1500mm","unit":"m³","price":"417.23"},
+        {"page":9,"code":"2.3.2","description":"Depth 1500–3000mm","descriptionAm":"ጥልቀት 1500–3000mm","unit":"m³","price":"476.83"},
+        {"page":9,"code":"2.3.3","description":"Depth 3000–4500mm","descriptionAm":"ጥልቀት 3000–4500mm","unit":"m³","price":"556.30"},
+        {"page":9,"code":"2.3.4","description":"Depth 4500–6000mm","descriptionAm":"ጥልቀት 4500–6000mm","unit":"m³","price":"667.56"},
+        {"page":9,"code":"2.3.5","description":"Depth 6000–7500mm","descriptionAm":"ጥልቀት 6000–7500mm","unit":"m³","price":"834.46"},
+        {"page":9,"code":"2.3.6","description":"Depth 7500–9000mm","descriptionAm":"ጥልቀት 7500–9000mm","unit":"m³","price":"1,054.05"},
+        {"page":9,"code":"2.3.7","description":"Depth 9000–10500mm","descriptionAm":"ጥልቀት 9000–10500mm","unit":"m³","price":"1,430.50"},
+        {"page":9,"code":"2.4.1","description":"Bulk excavation in soft rock — depth ≤1.5m","descriptionAm":"ለስላሳ አለት ውስጥ በጅምላ ቁፋሮ — ጥልቀት ≤1.5m","unit":"m³","price":"666.61"},
+        {"page":9,"code":"2.4.2","description":"Depth 1.5m–3m","descriptionAm":"ጥልቀት 1.5m–3m","unit":"m³","price":"760.13"},
+        {"page":9,"code":"2.4.3","description":"Depth 3.0m–4.5m","descriptionAm":"ጥልቀት 3.0m–4.5m","unit":"m³","price":"922.70"},
+        {"page":9,"code":"2.4.4","description":"Depth 4.5m–6.0m","descriptionAm":"ጥልቀት 4.5m–6.0m","unit":"m³","price":"1,318.14"},
+        {"page":9,"code":"2.4.5","description":"Depth 6.0m–7.5m","descriptionAm":"ጥልቀት 6.0m–7.5m","unit":"m³","price":"1,883.05"},
+        {"page":9,"code":"2.4.6","description":"Depth 7.5m–9.0m","descriptionAm":"ጥልቀት 7.5m–9.0m","unit":"m³","price":"2,690.08"},
+        {"page":9,"code":"2.4.7","description":"Depth 9.0m–10.5m","descriptionAm":"ጥልቀት 9.0m–10.5m","unit":"m³","price":"3,842.97"},
+        {"page":9,"code":"2.5.1","description":"Pit excavation in soft rock — depth ≤1.5m","descriptionAm":"ለስላሳ አለት ውስጥ የጉድጓድ ቁፋሮ — ጥልቀት ≤1.5m","unit":"m³","price":"829.55"},
+        {"page":9,"code":"2.5.2","description":"Depth 1.5m–3m","descriptionAm":"ጥልቀት 1.5m–3m","unit":"m³","price":"911.60"},
+        {"page":9,"code":"2.5.3","description":"Depth 3.0m–4.5m","descriptionAm":"ጥልቀት 3.0m–4.5m","unit":"m³","price":"1,128.64"},
+        {"page":9,"code":"2.5.4","description":"Depth 4.5m–6m","descriptionAm":"ጥልቀት 4.5m–6m","unit":"m³","price":"1,612.35"},
+        {"page":9,"code":"2.5.5","description":"Depth 6m–7.5m","descriptionAm":"ጥልቀት 6m–7.5m","unit":"m³","price":"2,303.36"},
+        {"page":9,"code":"2.5.6","description":"Depth 7.5m–9m","descriptionAm":"ጥልቀት 7.5m–9m","unit":"m³","price":"3,290.51"},
+        {"page":9,"code":"2.5.7","description":"Depth 9m–10.5m","descriptionAm":"ጥልቀት 9m–10.5m","unit":"m³","price":"4,700.72"},
+        {"page":9,"code":"2.6.1","description":"Bulk excavation in hard rock — depth ≤1.50m","descriptionAm":"ጠንካራ አለት ውስጥ በጅምላ ቁፋሮ — ጥልቀት ≤1.50m","unit":"m³","price":"1,368.24"},
+        {"page":9,"code":"2.6.2","description":"Depth 1.5m–3m","descriptionAm":"ጥልቀት 1.5m–3m","unit":"m³","price":"1,706.63"},
+        {"page":9,"code":"2.6.3","description":"Depth 3.0m–4.5m","descriptionAm":"ጥልቀት 3.0m–4.5m","unit":"m³","price":"2,051.20"},
+        {"page":10,"code":"2.6.4","description":"Depth 4.5m–6.0m","descriptionAm":"ጥልቀት 4.5m–6.0m","unit":"m³","price":"2,792.32"},
+        {"page":10,"code":"2.6.5","description":"Depth 6.0m–7.5m","descriptionAm":"ጥልቀት 6.0m–7.5m","unit":"m³","price":"3,490.40"},
+        {"page":10,"code":"2.6.6","description":"Depth 7.5m–9.0m","descriptionAm":"ጥልቀት 7.5m–9.0m","unit":"m³","price":"4,363.00"},
+        {"page":10,"code":"2.6.7","description":"Depth 9.0m–10.5m","descriptionAm":"ጥልቀት 9.0m–10.5m","unit":"m³","price":"5,132.95"},
+        {"page":10,"code":"2.7.1","description":"Pit excavation in hard rock — depth ≤1.50m","descriptionAm":"ጠንካራ አለት ውስጥ የጉድጓድ ቁፋሮ — ጥልቀት ≤1.50m","unit":"m³","price":"1,659.11"},
+        {"page":10,"code":"2.7.2","description":"Depth 1.5m–3m","descriptionAm":"ጥልቀት 1.5m–3m","unit":"m³","price":"2,051.09"},
+        {"page":10,"code":"2.7.3","description":"Depth 3.0m–4.5m","descriptionAm":"ጥልቀት 3.0m–4.5m","unit":"m³","price":"2,666.42"},
+        {"page":10,"code":"2.7.4","description":"Depth 4.5m–6m","descriptionAm":"ጥልቀት 4.5m–6m","unit":"m³","price":"3,627.78"},
+        {"page":10,"code":"2.7.5","description":"Depth 6.0m–7.5m","descriptionAm":"ጥልቀት 6.0m–7.5m","unit":"m³","price":"5,182.55"},
+        {"page":10,"code":"2.7.6","description":"Depth 7.5m–9m","descriptionAm":"ጥልቀት 7.5m–9m","unit":"m³","price":"7,403.64"},
+        {"page":10,"code":"2.7.7","description":"Depth 9m–10.5m","descriptionAm":"ጥልቀት 9m–10.5m","unit":"m³","price":"10,576.63"},
+        {"page":10,"code":"2.8.1","description":"Back fill selected excavated mats. from the site (mechanized)","descriptionAm":"ከጣቢያው የተመረጡ የተቆፈሩ ቁሳቁሶች መሙላት (በማሽን)","unit":"m³","price":"982.68"},
+        {"page":10,"code":"2.8.2","description":"Back fill from outside (Upto 20km) (Mechanized)","descriptionAm":"ከውጭ መሙላት (እስከ 20ኪሜ) (በማሽን)","unit":"m³","price":"3,066.43"},
+        {"page":10,"code":"2.8.3","description":"Back fill from outside (Upto 15km) (Mechanized)","descriptionAm":"ከውጭ መሙላት (እስከ 15ኪሜ) (በማሽን)","unit":"m³","price":"2,540.36"},
+        {"page":10,"code":"2.8.4","description":"Back fill from outside (Upto 10km) (Mechanized)","descriptionAm":"ከውጭ መሙላት (እስከ 10ኪሜ) (በማሽን)","unit":"m³","price":"2,180.98"},
+        {"page":10,"code":"2.8.5","description":"Back fill from outside (Upto 5km) (Mechanized)","descriptionAm":"ከውጭ መሙላት (እስከ 5ኪሜ) (በማሽን)","unit":"m³","price":"1,821.61"},
+        {"page":10,"code":"2.8.6","description":"25cm. thick basaltic hard core. (Mechanized)","descriptionAm":"25 ሴንቲ ሜትር። ውፍረት ያለው የባዝልት ሃርድኮር። (በማሽን)","unit":"m²","price":"1,099.89"}
       ]
-      
-// the catagories items are over 1500 lines this is just dample
-    }]
+    }
+  ]
+  //these are only two catagories out of many
 };END
 cat > src/data/ratebook.js << 'END'
 import { putAll, getAll, clearStore, put, getAllBy } from './db.js';
@@ -2351,12 +3652,15 @@ import { RATEBOOK } from './ratebook-data.js';
 
 function normalizeItem(catId, item, idx) {
   const rawPrice = String(item.price || '').replace(/,/g, '').trim();
-  const price = rawPrice === '' || rawPrice === 'â€”' ? null : parseFloat(rawPrice);
+  const price = rawPrice === '' || rawPrice === '—' ? null : parseFloat(rawPrice);
   return {
     id: catId + ':' + (item.code || idx) + ':' + idx,
+    source: 'works',
     categoryId: catId,
     code: item.code || '',
     description: item.description || '',
+    descriptionAm: item.descriptionAm || '',
+    tenderAliases: item.tenderAliases || [],
     unit: item.unit || '',
     basePrice: price,
     contractorPrice: price,
@@ -2366,12 +3670,18 @@ function normalizeItem(catId, item, idx) {
 
 export async function importRateBook(json) {
   const src = json || RATEBOOK;
-  if (!src || !Array.isArray(src.categories)) throw new Error('Invalid rate book data â€” missing "categories"');
+  if (!src || !Array.isArray(src.categories)) throw new Error('Invalid rate book data — missing "categories"');
   const categories = [];
   const items = [];
   src.categories.forEach(cat => {
     const catId = String(cat.id);
-    categories.push({ id: catId, title: cat.title || 'Untitled', itemCount: (cat.items || []).length });
+    categories.push({
+      id: catId,
+      source: 'works',
+      title: cat.title || 'Untitled',
+      titleAm: cat.titleAm || cat.title || 'Untitled',
+      itemCount: (cat.items || []).length
+    });
     (cat.items || []).forEach((item, idx) => items.push(normalizeItem(catId, item, idx)));
   });
   await clearStore('ratebook_categories');
@@ -2397,9 +3707,23 @@ export async function getRateBookMeta() {
   const rows = await getAll('meta');
   return rows.find(r => r.key === 'ratebook_source') || null;
 }
-export async function getRateCategories() { return getAll('ratebook_categories'); }
-export async function getRateItemsByCategory(catId) { return getAllBy('ratebook_items', 'by-category', catId); }
-export async function getRateItems() { return getAll('ratebook_items'); }
+
+export async function getRateCategories(source = null) {
+  const all = await getAll('ratebook_categories');
+  if (!source) return all;
+  return all.filter(c => c.source === source);
+}
+
+export async function getRateItems(source = null) {
+  const all = await getAll('ratebook_items');
+  if (!source) return all;
+  return all.filter(i => (i.source || 'works') === source);
+}
+
+export async function getRateItemsByCategory(catId) {
+  return getAllBy('ratebook_items', 'by-category', catId);
+}
+
 export async function updateRateItem(id, patch) {
   const rows = await getAll('ratebook_items');
   const item = rows.find(r => r.id === id);
@@ -2408,28 +3732,130 @@ export async function updateRateItem(id, patch) {
   await put('ratebook_items', next);
   return next;
 }
-export async function applyInflation(factor, alsoContractor = false) {
+
+export async function applyInflation(factor, alsoContractor = false, source = null) {
   const rows = await getAll('ratebook_items');
-  const updated = rows.map(r => {
-    if (r.basePrice == null) return r;
-    const next = Object.assign({}, r, { basePrice: Math.round(r.basePrice * factor * 100) / 100 });
-    if (alsoContractor) next.contractorPrice = next.basePrice;
-    return next;
-  });
+  const updated = rows
+    .filter(r => !source || (r.source || 'works') === source)
+    .map(r => {
+      if (r.basePrice == null) return r;
+      const next = Object.assign({}, r, { basePrice: Math.round(r.basePrice * factor * 100) / 100 });
+      if (alsoContractor) next.contractorPrice = next.basePrice;
+      return next;
+    });
   await putAll('ratebook_items', updated);
   return updated.length;
 }
-export async function resetContractorPrices() {
+
+export async function resetContractorPrices(source = null) {
   const rows = await getAll('ratebook_items');
-  const updated = rows.map(r => Object.assign({}, r, { contractorPrice: r.basePrice }));
+  const updated = rows
+    .filter(r => !source || (r.source || 'works') === source)
+    .map(r => Object.assign({}, r, { contractorPrice: r.basePrice }));
   await putAll('ratebook_items', updated);
   return updated.length;
 }
-export async function clearRateBook() {
+
+export async function clearRateBook(source = null) {
+  if (!source) {
+    await clearStore('ratebook_categories');
+    await clearStore('ratebook_items');
+    await clearStore('meta');
+    return;
+  }
+  const allItems = await getAll('ratebook_items');
+  const allCats = await getAll('ratebook_categories');
+  const keepItems = allItems.filter(i => (i.source || 'works') !== source);
+  const keepCats = allCats.filter(c => (c.source || 'works') !== source);
   await clearStore('ratebook_categories');
   await clearStore('ratebook_items');
-  await clearStore('meta');
+  await putAll('ratebook_categories', keepCats);
+  await putAll('ratebook_items', keepItems);
 }
+
+export async function migrateRateBook() {
+  const items = await getAll('ratebook_items');
+  const itemsToFix = items.filter(i =>
+    i.descriptionAm === undefined ||
+    i.tenderAliases === undefined ||
+    i.source === undefined
+  );
+  if (itemsToFix.length > 0) {
+    await putAll('ratebook_items', itemsToFix.map(i => ({
+      ...i,
+      descriptionAm: i.descriptionAm ?? '',
+      tenderAliases: i.tenderAliases ?? [],
+      source: i.source ?? 'works'
+    })));
+  }
+  const cats = await getAll('ratebook_categories');
+  const catsToFix = cats.filter(c => c.titleAm === undefined || c.source === undefined);
+  if (catsToFix.length > 0) {
+    await putAll('ratebook_categories', catsToFix.map(c => ({
+      ...c,
+      titleAm: c.titleAm ?? c.title,
+      source: c.source ?? 'works'
+    })));
+  }
+  return { itemsFixed: itemsToFix.length, categoriesFixed: catsToFix.length };
+}
+
+export async function addTenderAlias(rateItemId, tenderDescription) {
+  const alias = String(tenderDescription || '').trim().replace(/\s+/g, ' ');
+  if (alias.length < 3) return null;
+  const rows = await getAll('ratebook_items');
+  const item = rows.find(r => r.id === rateItemId);
+  if (!item) return null;
+  const existing = item.tenderAliases || [];
+  const lower = alias.toLowerCase();
+  if (existing.some(a => a.toLowerCase() === lower)) return item;
+  const next = { ...item, tenderAliases: [...existing, alias] };
+  await put('ratebook_items', next);
+  return next;
+}
+
+export async function removeTenderAlias(rateItemId, alias) {
+  const rows = await getAll('ratebook_items');
+  const item = rows.find(r => r.id === rateItemId);
+  if (!item) return null;
+  const next = { ...item, tenderAliases: (item.tenderAliases || []).filter(a => a !== alias) };
+  await put('ratebook_items', next);
+  return next;
+}
+
+export async function createRateItem({ description, descriptionAm = '', unit, rate, categoryId = 'custom', source = 'works' }) {
+  const clean = String(description || '').trim().replace(/\s+/g, ' ');
+  if (!clean) throw new Error('Description required');
+  const id = source + ':custom:' + Date.now().toString(36) + ':' + Math.random().toString(36).slice(2, 6);
+  const next = {
+    id,
+    source,
+    categoryId,
+    code: '',
+    description: clean,
+    descriptionAm: String(descriptionAm || '').trim(),
+    tenderAliases: [clean],
+    unit: String(unit || ''),
+    basePrice: Number(rate) || 0,
+    contractorPrice: Number(rate) || 0,
+    page: 0
+  };
+  await put('ratebook_items', next);
+
+  const cats = await getAll('ratebook_categories');
+  const catId = source + ':custom';
+  if (!cats.some(c => c.id === catId)) {
+    await put('ratebook_categories', {
+      id: catId,
+      source,
+      title: source === 'goods' ? 'Custom goods' : 'Custom items',
+      titleAm: source === 'goods' ? 'ብጁ ዕቃዎች' : 'ብጁ ዕቃዎች (ከጨረታ የተጨመሩ)',
+      itemCount: 0
+    });
+  }
+  return next;
+}END
+cat > src/data/rbd.js << 'END'
 END
 cat > src/data/remote.js << 'END'
 import { supabase } from '../lib/supabase.js';
@@ -2505,6 +3931,8 @@ export function newRequestId() { return 'req_' + Date.now().toString(36) + '_' +
 END
 cat > src/data/store.js << 'END'
 import { useState, useEffect } from 'preact/hooks';
+import { saveBusinessInfo, getBusinessInfo } from './business.js';
+
 const KEY = 'mesay_data_v2';
 
 export const DEFAULT_DATA = {
@@ -2551,42 +3979,9 @@ export const DEFAULT_DATA = {
     { id: 'sv4', icon: '📦', titleEn: 'General material Supply', titleAm: 'አጠቃላይ አቅርቦት', descEn: 'Construction materials, fixtures, and equipment supply.' }
   ],
   projects: [
-    {
-      id: 'p1',
-      title: 'Network Tower and compound fence',
-      type: 'Telecom',
-      icon: '🏢',
-      image: 'img/messe/1.jpg',
-      desc: 'Telecom infrastructure for safaricom.',
-      budget: 'ETB 85,000,000',
-      duration: '24 months',
-      year: 2024,
-      client: 'Safaricom Ethiopia'
-    },
-    {
-      id: 'p2',
-      title: 'solar panel array',
-      type: 'Telecom',
-      icon: '🛣️',
-      image: 'img/messe/2.jpg',
-      desc: 'solar power supply for network tower installation',
-      budget: 'ETB 42,000,000',
-      duration: '14 months',
-      year: 2023,
-      client: 'Safaricom-ethiopia'
-    },
-    {
-      id: 'p3',
-      title: 'Commercial Office Fit-out',
-      type: 'building',
-      icon: '🏢',
-      image: 'img/messe/3.jpg',
-      desc: '1,800 m² office interior fit-out.',
-      budget: 'ETB 28,000,000',
-      duration: '8 months',
-      year: 2023,
-      client: 'Private client'
-    }
+    { id: 'p1', title: 'Network Tower and compound fence', type: 'Telecom', icon: '🏢', image: 'img/messe/1.jpg', desc: 'Telecom infrastructure for safaricom.', budget: 'ETB 85,000,000', duration: '24 months', year: 2024, client: 'Safaricom Ethiopia' },
+    { id: 'p2', title: 'solar panel array', type: 'Telecom', icon: '🛣️', image: 'img/messe/2.jpg', desc: 'solar power supply for network tower installation', budget: 'ETB 42,000,000', duration: '14 months', year: 2023, client: 'Safaricom-ethiopia' },
+    { id: 'p3', title: 'Commercial Office Fit-out', type: 'building', icon: '🏢', image: 'img/messe/3.jpg', desc: '1,800 m² office interior fit-out.', budget: 'ETB 28,000,000', duration: '8 months', year: 2023, client: 'Private client' }
   ],
   reviews: [
     { id: 'r1', name: 'Ato Bekele T.', loc: 'Addis Ababa', stars: 5, text: 'Delivered our residential building on schedule. Professional site management.' },
@@ -2594,11 +3989,11 @@ export const DEFAULT_DATA = {
     { id: 'r3', name: 'W/ro Hana G.', loc: 'Addis Ababa', stars: 5, text: 'Office fit-out finished on time and on budget.' }
   ],
   categories: [
-    { id: 'cement',    name: 'Cement & Binders', nameAm: 'ሲሚንቶ', icon: '🧱' },
-    { id: 'steel',     name: 'Steel & Rebar',    nameAm: 'ብረት', icon: '🔩' },
-    { id: 'lumber',    name: 'Lumber & Timber',  nameAm: 'እንጨት', icon: '🪵' },
-    { id: 'aggregate', name: 'Aggregates',       nameAm: 'ጠጠር እና አሸዋ', icon: '⛰️' },
-    { id: 'fixtures',  name: 'Fixtures & Pipes', nameAm: 'ቧንቧ እና መለዋወጫ', icon: '🚰' }
+    { id: 'cement', name: 'Cement & Binders', nameAm: 'ሲሚንቶ', icon: '🧱' },
+    { id: 'steel', name: 'Steel & Rebar', nameAm: 'ብረት', icon: '🔩' },
+    { id: 'lumber', name: 'Lumber & Timber', nameAm: 'እንጨት', icon: '🪵' },
+    { id: 'aggregate', name: 'Aggregates', nameAm: 'ጠጠር እና አሸዋ', icon: '⛰️' },
+    { id: 'fixtures', name: 'Fixtures & Pipes', nameAm: 'ቧንቧ እና መለዋወጫ', icon: '🚰' }
   ],
   products: [
     { id: 'sku_cem_425', category: 'cement', name: 'Dangote / Mugher OPC 42.5N', unit: 'quintal (100 kg)', basePrice: 1050, contractorPrice: 1050, stock: 24000, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 1050 }, { min: 20, price: 1020 }, { min: 100, price: 990 } ] },
@@ -2612,51 +4007,73 @@ export const DEFAULT_DATA = {
     { id: 'sku_fix_pvc110', category: 'fixtures', name: 'PVC Pipe Ø110 mm x 6 m', unit: 'piece', basePrice: 1650, contractorPrice: 1650, stock: 900, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 1650 }, { min: 20, price: 1580 }, { min: 100, price: 1500 } ] },
     { id: 'sku_fix_pvc63', category: 'fixtures', name: 'PVC Pipe Ø63 mm x 6 m', unit: 'piece', basePrice: 780, contractorPrice: 780, stock: 1400, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 780 }, { min: 20, price: 740 }, { min: 100, price: 700 } ] }
   ],
-  freight: {
-    zones: [
-      { id: 'addis',    name: 'Addis Ababa',        flat: 800,  perTon: 40 },
-      { id: 'nearby',   name: 'Within 100 km',      flat: 1800, perTon: 75 },
-      { id: 'regional', name: 'Regional (100-400)', flat: 4500, perTon: 140 },
-      { id: 'far',      name: 'Remote (> 400 km)',  flat: 9000, perTon: 220 }
-    ]
-  },
-  hero: {
-    badge1En: 'General Contractor G5', badge1Am: 'አጠቃላይ ተቋራጭ 511114',
-    badge2En: 'Trusted', badge2Am: 'ma',
-    badge3En: '10+ Years', badge3Am: '18+ ዓመታት'
-  },
-  stats: [
-    { id: 's1', num: '120+', lblEn: 'Projects Delivered', lblAm: 'የተጠናቀቁ ፕሮጀክቶች' },
-    { id: 's2', num: '18+',  lblEn: 'Years in Business',  lblAm: 'የንግድ ዓመታት' },
-    { id: 's3', num: '511114', lblEn: 'License Code',     lblAm: 'የፈቃድ ኮድ' },
-    { id: 's4', num: '100%', lblEn: 'VAT Registered',     lblAm: 'ተ.እ.ታ ተመዝጋቢ' }
-  ]
+  freight: { zones: [ { id: 'addis', name: 'Addis Ababa', flat: 800, perTon: 40 }, { id: 'nearby', name: 'Within 100 km', flat: 1800, perTon: 75 }, { id: 'regional', name: 'Regional (100-400)', flat: 4500, perTon: 140 }, { id: 'far', name: 'Remote (> 400 km)', flat: 9000, perTon: 220 } ] },
+  hero: { badge1En: 'General Contractor G5', badge1Am: 'አጠቃላይ ተቋራጭ 511114', badge2En: 'Trusted', badge2Am: 'ma', badge3En: '10+ Years', badge3Am: '18+ ዓመታት' },
+  stats: [ { id: 's1', num: '120+', lblEn: 'Projects Delivered', lblAm: 'የተጠናቀቁ ፕሮጀክቶች' }, { id: 's2', num: '18+',  lblEn: 'Years in Business',  lblAm: 'የንግድ ዓመታት' }, { id: 's3', num: '511114', lblEn: 'License Code',     lblAm: 'የፈቃድ ኮድ' }, { id: 's4', num: '100%', lblEn: 'VAT Registered',     lblAm: 'ተ.እ.ታ ተመዝጋቢ' } ]
 };
 
-function load() {
-  try {
-    const raw = localStorage.getItem(KEY);
-    if (!raw) return DEFAULT_DATA;
-    return Object.assign({}, DEFAULT_DATA, JSON.parse(raw));
-  } catch (e) { return DEFAULT_DATA; }
-}
-
-let _state = load();
+let _state = DEFAULT_DATA;
 const subs = new Set();
+
+// Sync state to components
 export function getData() { return _state; }
 export function subscribe(fn) { subs.add(fn); return () => subs.delete(fn); }
 export function setData(next) {
   _state = next;
-  try { localStorage.setItem(KEY, JSON.stringify(next)); } catch (e) {}
+  // Save "business" to IndexedDB
+  if (next.business) saveBusinessInfo(next.business).catch(e => console.warn('Save business failed', e));
   subs.forEach(fn => fn(next));
 }
 export function resetData() { setData(DEFAULT_DATA); }
+
 export function useStore() {
   const [d, setD] = useState(_state);
-  useEffect(() => subscribe(setD), []);
+  
+  useEffect(() => {
+    let alive = true;
+    
+    // Load from IndexedDB (with migration from localStorage if needed)
+    (async () => {
+      try {
+        const idbBiz = await getBusinessInfo();
+        if (idbBiz) {
+          _state = { ..._state, business: idbBiz };
+          if (alive) setD(_state);
+        } else {
+          // Migration: load from localStorage once
+          const raw = localStorage.getItem(KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed.business) {
+              await saveBusinessInfo(parsed.business);
+              _state = { ..._state, business: parsed.business };
+              if (alive) setD(_state);
+              console.log('Migrated business to IndexedDB');
+            }
+          }
+        }
+      } catch (e) { console.warn('DB load error:', e); }
+    })();
+    
+    return subscribe(d => { if (alive) setD(d); });
+  }, []);
+  
   return [d, setData];
 }
+
 export function uid() { return 'id_' + Math.random().toString(36).slice(2, 9); }END
+cat > src/data/tenders.js << 'END'
+import { putAll, getAll, get, put, del } from './db.js';
+
+export const saveTenders      = (list)    => putAll('egp_tenders', list);
+export const getTenders       = ()        => getAll('egp_tenders');
+export const deleteTender     = (id)      => del('egp_tenders', id);
+
+export const saveTenderDetail = (d)       => put('egp_tender_details', d);
+export const getTenderDetail  = (lotId)   => get('egp_tender_details', lotId);
+
+export const saveTenderItems  = (rec)     => put('egp_tender_items', rec);
+export const getTenderItems   = (key)     => get('egp_tender_items', key);END
 cat > src/admin/Admin.jsx << 'END'
 import { useState, useEffect } from 'preact/hooks';
 import { useStore } from '../data/store.js';
@@ -2666,19 +4083,18 @@ import { AdminHome, ADMIN_TOOLS } from './AdminHome.jsx';
 import { RequestsTab } from './RequestsTab.jsx';
 import { ProformasTab } from './ProformasTab.jsx';
 import { RateBookTab } from './RateBookTab.jsx';
+import { TendersTab } from './TendersTab.jsx';
 import { CatalogTab, ProjectsTab, ReviewsTab, BusinessTab, UsersTab, SettingsTab } from './Tabs.jsx';
 import { ProformaBuilder } from '../components/ProformaBuilder.jsx';
-
 
 export function Admin({ onExit }) {
   const [data] = useStore();
   const [tab, setTab] = useState('home');
-  const [builder, setBuilder] = useState(null); // { mode: 'from-request' | 'internal', request }
+  const [builder, setBuilder] = useState(null);
 
   const viewSite = () => { sessionStorage.removeItem('mesay_staff'); onExit(); };
   const leave = async () => { sessionStorage.removeItem('mesay_staff'); await signOut(); onExit(); };
 
-  // The sessionStorage flag is only a client hint: confirm there is still an admin session
   useEffect(() => {
     (async () => {
       if (!supabase) { viewSite(); return; }
@@ -2693,10 +4109,11 @@ export function Admin({ onExit }) {
 
   let body;
   if (builder) {
-    body = <ProformaBuilder key={builder.mode + (builder.request ? builder.request.id : '')} mode={builder.mode} request={builder.request} onClose={() => setBuilder(null)} />;
+    body = <ProformaBuilder key={builder.mode + (builder.request ? (builder.request.id || builder.request.tender?.id || '') : '')} mode={builder.mode} request={builder.request} onClose={() => setBuilder(null)} />;
   } else if (tab === 'home') body = <AdminHome onOpen={go} />;
   else if (tab === 'requests') body = <RequestsTab onBuildProforma={(r) => openBuilder('from-request', r)} />;
-  else if (tab === 'proformas') body = <ProformasTab onNew={(mode) => openBuilder(mode)} onGoRequests={() => go('requests')} />;
+  else if (tab === 'tenders') body = <TendersTab onCreateProforma={(payload) => openBuilder('from-tender', payload)} />;
+  else if (tab === 'proformas') body = <ProformasTab onNew={(mode) => openBuilder(mode)} onGoRequests={() => go('requests')} onGoTenders={() => go('tenders')} />;
   else if (tab === 'ratebook') body = <RateBookTab />;
   else if (tab === 'catalog') body = <CatalogTab />;
   else if (tab === 'projects') body = <ProjectsTab />;
@@ -2708,14 +4125,14 @@ export function Admin({ onExit }) {
   return (
     <div class="admin">
       <div class="admin-header">
-        <strong>{data.business.nameEn} Â· Admin</strong>
+        <strong>{data.business.nameEn} · Admin</strong>
         <div class="admin-header-actions">
           <button class="btn-view" onClick={viewSite}>View Site</button>
           <button class="btn-danger" onClick={leave}>Sign out</button>
         </div>
       </div>
       <div class="admin-tabs">
-        <button class={'admin-tab ' + (tab === 'home' && !builder ? 'active' : '')} onClick={() => go('home')}>ðŸ  Home</button>
+        <button class={'admin-tab ' + (tab === 'home' && !builder ? 'active' : '')} onClick={() => go('home')}>Home</button>
         {ADMIN_TOOLS.map(t => (
           <button class={'admin-tab ' + (tab === t.id ? 'active' : '')} key={t.id} onClick={() => go(t.id)}>{t.icon} {t.title}</button>
         ))}
@@ -2723,27 +4140,30 @@ export function Admin({ onExit }) {
       <div class="admin-body">{body}</div>
     </div>
   );
-}
-END
+}END
 cat > src/admin/AdminHome.jsx << 'END'
 import { useState, useEffect } from 'preact/hooks';
 import { useStore } from '../data/store.js';
 import { getRequests } from '../data/requests.js';
 import { getProformas } from '../data/proformas.js';
 import { getRateItems } from '../data/ratebook.js';
+import { getTenders } from '../data/tenders.js';
 import { supabase } from '../lib/supabase.js';
 import { BUSINESS_FIELDS } from './fields.js';
 
+
+
 export const ADMIN_TOOLS = [
-  { id: 'requests', icon: 'ðŸ“¥', title: 'Quote Requests', subtitle: 'Service and material requests from clients', unit: 'requests' },
-  { id: 'proformas', icon: 'ðŸ§¾', title: 'Proformas', subtitle: 'Build, track and print quotations', unit: 'proformas' },
-  { id: 'ratebook', icon: 'ðŸ“–', title: 'Rate Book', subtitle: 'Bureau unit rates and contractor prices', unit: 'items' },
-  { id: 'catalog', icon: 'ðŸ§±', title: 'Materials Catalog', subtitle: 'Products shown to customers', unit: 'products' },
-  { id: 'projects', icon: 'ðŸ—ï¸', title: 'Projects', subtitle: 'Recent projects gallery', unit: 'projects' },
-  { id: 'reviews', icon: 'â­', title: 'Reviews', subtitle: 'Client testimonials', unit: 'reviews' },
-  { id: 'business', icon: 'ðŸ¢', title: 'Business Info', subtitle: 'License, contacts and address', unit: 'fields set' },
-  { id: 'users', icon: 'ðŸ‘¥', title: 'Users/Roles', subtitle: 'Who can sign in to admin', unit: 'admins' },
-  { id: 'settings', icon: 'âš™ï¸', title: 'Settings', subtitle: 'VAT, terms, markup and freight', unit: 'freight zones' }
+  { id: 'requests',  icon: 'Inbox',     title: 'Quote Requests',   subtitle: 'Service and material requests from clients', unit: 'requests' },
+  { id: 'tenders',   icon: 'Tenders',   title: 'Tenders',          subtitle: 'eGP construction bids',                      unit: 'tenders' },
+  { id: 'proformas', icon: 'Proforma',  title: 'Proformas',        subtitle: 'Build, track and print quotations',          unit: 'proformas' },
+  { id: 'ratebook',  icon: 'Rate Book', title: 'Rate Book',        subtitle: 'Bureau unit rates and contractor prices',    unit: 'items' },
+  { id: 'catalog',   icon: 'Catalog',   title: 'Materials Catalog',subtitle: 'Products shown to customers',                unit: 'products' },
+  { id: 'projects',  icon: 'Projects',  title: 'Projects',         subtitle: 'Recent projects gallery',                    unit: 'projects' },
+  { id: 'reviews',   icon: 'Reviews',   title: 'Reviews',          subtitle: 'Client testimonials',                        unit: 'reviews' },
+  { id: 'business',  icon: 'Business',  title: 'Business Info',    subtitle: 'License, contacts and address',              unit: 'fields set' },
+  { id: 'users',     icon: 'Users',     title: 'Users/Roles',      subtitle: 'Who can sign in to admin',                   unit: 'admins' },
+  { id: 'settings',  icon: 'Settings',  title: 'Settings',         subtitle: 'VAT, terms, markup and freight',             unit: 'freight zones' }
 ];
 
 export function AdminHome({ onOpen }) {
@@ -2756,6 +4176,7 @@ export function AdminHome({ onOpen }) {
     (async () => {
       const next = {};
       try { next.requests = (await getRequests()).length; } catch (e) {}
+      try { next.tenders = (await getTenders()).length; } catch (e) {}
       try { next.proformas = (await getProformas()).length; } catch (e) {}
       try { next.ratebook = (await getRateItems()).length; } catch (e) {}
       if (supabase) {
@@ -2771,6 +4192,7 @@ export function AdminHome({ onOpen }) {
 
   const live = {
     requests: counts.requests,
+    tenders: counts.tenders,
     proformas: counts.proformas,
     ratebook: counts.ratebook,
     catalog: data.products.length,
@@ -2780,7 +4202,7 @@ export function AdminHome({ onOpen }) {
     users: counts.users,
     settings: data.freight.zones.length
   };
-  const show = (id) => live[id] != null ? live[id] : (loaded ? 'â€”' : 'â€¦');
+  const show = (id) => live[id] != null ? live[id] : (loaded ? '0' : '...');
 
   return (
     <div class="admin-panel">
@@ -2797,8 +4219,7 @@ export function AdminHome({ onOpen }) {
       </div>
     </div>
   );
-}
-END
+}END
 cat > src/admin/ProformasTab.jsx << 'END'
 import { useState, useEffect } from 'preact/hooks';
 import { getProformas, deleteProforma, duplicateProforma, updateProformaStatus } from '../data/proformas.js';
@@ -2807,7 +4228,7 @@ import { ProformaDoc } from '../components/ProformaBuilder.jsx';
 
 const STATUSES = ['draft', 'sent', 'accepted', 'rejected', 'expired'];
 
-export function ProformasTab({ onNew, onGoRequests }) {
+export function ProformasTab({ onNew, onGoRequests, onGoTenders }) {
   const [rows, setRows] = useState(null);
   const [chooser, setChooser] = useState(false);
   const [viewing, setViewing] = useState(null);
@@ -2826,14 +4247,14 @@ export function ProformasTab({ onNew, onGoRequests }) {
     return (
       <div class="admin-panel">
         <div class="pf-actions no-print">
-          <button class="btn btn-back" onClick={() => setViewing(null)}>â† Back</button>
+          <button class="btn btn-back" onClick={() => setViewing(null)}>Back</button>
           <button class="btn btn-primary" onClick={() => window.print()}>Print</button>
         </div>
         <ProformaDoc pf={viewing} />
       </div>
     );
   }
-  if (!rows) return <div class="admin-panel"><h2>Proformas</h2><p>Loadingâ€¦</p></div>;
+  if (!rows) return <div class="admin-panel"><h2>Proformas</h2><p>Loading...</p></div>;
 
   return (
     <div class="admin-panel">
@@ -2845,8 +4266,15 @@ export function ProformasTab({ onNew, onGoRequests }) {
         <div class="admin-card">
           <strong>Start a proforma</strong>
           <div class="pf-actions">
-            <button class="btn btn-back" onClick={onGoRequests}>From a request (pick one in Quote Requests)</button>
-            <button class="btn btn-primary" onClick={() => onNew('internal')}>Internal / open bidding</button>
+            <button class="btn btn-back" onClick={() => { setChooser(false); onGoRequests && onGoRequests(); }}>
+              From a request
+            </button>
+            <button class="btn btn-primary" onClick={() => { setChooser(false); onNew('internal'); }}>
+              Internal / open bidding
+            </button>
+            <button class="btn btn-back" onClick={() => { setChooser(false); onGoTenders && onGoTenders(); }}>
+              From eGP tender
+            </button>
           </div>
         </div>
       )}
@@ -2861,7 +4289,7 @@ export function ProformasTab({ onNew, onGoRequests }) {
             </select>
           </div>
           <div style="font-size:0.85rem;color:var(--gray);">
-            {(p.client && p.client.name) || 'â€”'} Â· {p.createdAt} Â· {p.mode === 'internal' ? 'Internal' : 'From request'} Â· <strong>{formatMoney(p.totals && p.totals.grandTotal)}</strong>
+            {(p.client && p.client.name) || '-'} · {p.createdAt} · {p.mode === 'internal' ? 'Internal' : (p.mode === 'from-tender' ? 'From tender' : 'From request')} · <strong>{formatMoney(p.totals && p.totals.grandTotal)}</strong>
           </div>
           <div class="pf-actions">
             <button class="btn btn-back" onClick={() => setViewing(p)}>View</button>
@@ -2872,19 +4300,22 @@ export function ProformasTab({ onNew, onGoRequests }) {
       ))}
     </div>
   );
-}
-END
+}END
 cat > src/admin/RateBookTab.jsx << 'END'
 import { useState, useEffect, useMemo } from 'preact/hooks';
 import { useStore } from '../data/store.js';
 import {
   getRateBookMeta, getRateCategories, getRateItems, updateRateItem,
-  applyInflation, resetContractorPrices, seedFromModule
+  applyInflation, resetContractorPrices, seedFromModule,
 } from '../data/ratebook.js';
+import { importGoods, getGoodsMeta } from '../data/goods.js';
+import { GOODS } from '../data/goods-data.js';
 
 export function RateBookTab() {
   const [data] = useStore();
+  const [source, setSource] = useState('works');
   const [meta, setMeta] = useState(null);
+  const [goodsMeta, setGoodsMeta] = useState(null);
   const [cats, setCats] = useState([]);
   const [items, setItems] = useState([]);
   const [cat, setCat] = useState('all');
@@ -2892,90 +4323,208 @@ export function RateBookTab() {
   const [factor, setFactor] = useState(String(data.business.inflationFactor || 1));
   const [alsoContractor, setAlsoContractor] = useState(false);
   const [msg, setMsg] = useState('');
+  const [bulkOpen, setBulkOpen] = useState(false);
+  const [bulkText, setBulkText] = useState('');
 
   const load = async () => {
-    setMeta(await getRateBookMeta());
-    setCats(await getRateCategories());
-    setItems(await getRateItems());
+    const [m, gm, c, i] = await Promise.all([
+      getRateBookMeta(),
+      getGoodsMeta(),
+      getRateCategories(),
+      getRateItems(),
+    ]);
+    setMeta(m); setGoodsMeta(gm); setCats(c); setItems(i);
   };
+
   useEffect(() => { load(); }, []);
+  useEffect(() => { load(); }, [source]);
+
+  const activeMeta = source === 'goods' ? goodsMeta : meta;
+  const activeCats = useMemo(() => cats.filter(c => (c.source || 'works') === source), [cats, source]);
 
   const results = useMemo(() => {
     const s = q.trim().toLowerCase();
-    return items.filter(i =>
-      (cat === 'all' || i.categoryId === cat) &&
-      (!s || String(i.code).toLowerCase().includes(s) || String(i.description).toLowerCase().includes(s))
-    );
-  }, [items, cat, q]);
+    return items.filter(i => {
+      if ((i.source || 'works') !== source) return false;
+      if (cat !== 'all' && i.categoryId !== cat) return false;
+      if (!s) return true;
+      return (
+        String(i.code).toLowerCase().includes(s) ||
+        String(i.description).toLowerCase().includes(s) ||
+        String(i.descriptionAm || '').includes(s) ||
+        (i.tenderAliases || []).some(a => a.toLowerCase().includes(s))
+      );
+    });
+  }, [items, cat, q, source]);
 
   const savePrice = async (item, raw) => {
     const v = raw === '' ? null : parseFloat(raw);
     await updateRateItem(item.id, { contractorPrice: v });
     setItems(items.map(i => i.id === item.id ? Object.assign({}, i, { contractorPrice: v }) : i));
   };
+
+  const saveAmharic = async (item, v) => {
+    await updateRateItem(item.id, { descriptionAm: v });
+    setItems(items.map(i => i.id === item.id ? Object.assign({}, i, { descriptionAm: v }) : i));
+  };
+
   const inflate = async () => {
     const f = parseFloat(factor);
     if (!f || f <= 0) { setMsg('Enter a valid factor, e.g. 1.05'); return; }
-    if (!confirm('Multiply all base prices by ' + f + '?')) return;
-    const n = await applyInflation(f, alsoContractor);
+    if (!confirm(`Multiply all ${source} base prices by ${f}?`)) return;
+    const n = await applyInflation(f, alsoContractor, source);
     setMsg('Updated ' + n + ' items.'); load();
   };
+
   const resetPrices = async () => {
-    if (!confirm('Reset every contractor price to its base price?')) return;
-    const n = await resetContractorPrices();
+    if (!confirm(`Reset every ${source} contractor price to its base price?`)) return;
+    const n = await resetContractorPrices(source);
     setMsg('Reset ' + n + ' items.'); load();
   };
-  const reseed = async () => {
-    if (!confirm('Reload the bundled rate book? This replaces all rate book items and edits.')) return;
+
+  const reseedWorks = async () => {
+    if (!confirm('Reload the civil-works rate book? This replaces all civil-works items.')) return;
     const r = await seedFromModule();
-    setMsg('Loaded ' + r.itemCount + ' items in ' + r.categoryCount + ' categories.'); load();
+    setMsg('Loaded ' + r.itemCount + ' works items.'); load();
+  };
+
+  const loadGoods = async () => {
+    if (!confirm('Load the goods catalog? Existing goods items will be replaced.')) return;
+    const r = await importGoods(GOODS);
+    setMsg('Loaded ' + r.itemCount + ' goods items.'); load();
+  };
+
+  const applyBulk = async () => {
+    const lines = bulkText.split('\n').map(l => l.trim()).filter(Boolean);
+    if (lines.length === 0) { setMsg('Nothing to import.'); return; }
+    let updated = 0, missed = 0;
+    for (const line of lines) {
+      const parts = line.split(/\t|,(?=[\u1200-\u137F])/);
+      if (parts.length < 2) { missed++; continue; }
+      const code = parts[0].trim();
+      const am = parts.slice(1).join(',').trim();
+      if (!code || !am) { missed++; continue; }
+      const target = items.find(i => (i.source || 'works') === source && i.code === code);
+      if (!target) { missed++; continue; }
+      await updateRateItem(target.id, { descriptionAm: am });
+      updated++;
+    }
+    await load();
+    setMsg(`Bulk import: ${updated} updated, ${missed} skipped.`);
+    setBulkText('');
+    setBulkOpen(false);
   };
 
   return (
     <div class="admin-panel">
       <div class="admin-panel-head">
-        <h2>Rate Book ({items.length} items)</h2>
-        <button class="btn-add" onClick={reseed}>Reload bundled rate book</button>
+        <h2>Rate Book — {source === 'goods' ? 'Goods' : 'Civil works'} ({results.length} items)</h2>
+        <div class="pf-actions" style="margin:0;">
+          <select value={source} onChange={e => { setSource(e.target.value); setCat('all'); }}>
+            <option value="works">Civil works</option>
+            <option value="goods">Goods</option>
+          </select>
+          <button class="btn btn-back" onClick={load}>Refresh</button>
+          <button class="btn btn-back" onClick={() => setBulkOpen(!bulkOpen)}>
+            {bulkOpen ? 'Close bulk' : 'Bulk paste Amharic'}
+          </button>
+          {source === 'works'
+            ? <button class="btn-add" onClick={reseedWorks}>Reload works</button>
+            : <button class="btn-add" onClick={loadGoods}>Load goods catalog</button>}
+        </div>
       </div>
-      {meta && <div class="admin-card" style="font-size:0.85rem;color:var(--gray);">{meta.document || meta.source} {meta.quarter} Â· {meta.currency} Â· imported {String(meta.importedAt).slice(0, 10)}</div>}
+
+      {activeMeta && (
+        <div class="admin-card" style="font-size:0.85rem;color:var(--gray);">
+          {activeMeta.source || ''} {activeMeta.quarter || ''} · imported {String(activeMeta.importedAt || '').slice(0, 10)}
+        </div>
+      )}
       {msg && <div class="admin-msg">{msg}</div>}
+
+      {bulkOpen && (
+        <div class="admin-card">
+          <strong>Bulk Amharic import ({source})</strong>
+          <p style="font-size:0.8rem;color:var(--gray);margin:4px 0 8px;">
+            One line per item: <code>code&lt;TAB&gt;amharic description</code>.
+          </p>
+          <textarea
+            rows="6"
+            style="width:100%;font-family:monospace;font-size:0.82rem;padding:8px;border:1px solid var(--border);border-radius:6px;"
+            value={bulkText}
+            onInput={e => setBulkText(e.target.value)}
+          />
+          <div class="pf-actions">
+            <button class="btn-add" onClick={applyBulk}>Apply</button>
+            <button class="btn btn-back" onClick={() => { setBulkText(''); setBulkOpen(false); }}>Cancel</button>
+          </div>
+        </div>
+      )}
 
       <div class="admin-card">
         <div class="admin-grid3">
-          <div class="admin-field"><label>Inflation factor</label><input type="number" step="any" value={factor} onInput={e => setFactor(e.target.value)} /></div>
-          <div class="admin-field"><label>Also set contractor price</label><select value={alsoContractor ? 'yes' : 'no'} onChange={e => setAlsoContractor(e.target.value === 'yes')}><option value="no">No</option><option value="yes">Yes</option></select></div>
-          <div class="admin-field"><label>&nbsp;</label><button class="btn-add" onClick={inflate}>Apply</button></div>
+          <div class="admin-field"><label>Inflation factor</label>
+            <input type="number" step="any" value={factor} onInput={e => setFactor(e.target.value)} /></div>
+          <div class="admin-field"><label>Also set contractor price</label>
+            <select value={alsoContractor ? 'yes' : 'no'} onChange={e => setAlsoContractor(e.target.value === 'yes')}>
+              <option value="no">No</option><option value="yes">Yes</option>
+            </select></div>
+          <div class="admin-field"><label>&nbsp;</label>
+            <button class="btn-add" onClick={inflate}>Apply</button></div>
         </div>
         <button class="btn-del" onClick={resetPrices}>Reset contractor prices</button>
       </div>
 
       <div class="admin-grid2">
-        <div class="admin-field"><label>Search</label><input value={q} onInput={e => setQ(e.target.value)} placeholder="Code or description" /></div>
+        <div class="admin-field"><label>Search (English or Amharic)</label>
+          <input value={q} onInput={e => setQ(e.target.value)} placeholder="Code, description, or አማርኛ" /></div>
         <div class="admin-field"><label>Category</label>
           <select value={cat} onChange={e => setCat(e.target.value)}>
             <option value="all">All categories</option>
-            {cats.map(c => <option value={c.id}>{c.id}. {c.title}</option>)}
+            {activeCats.map(c => (
+              <option value={c.id}>{c.titleAm || c.title}</option>
+            ))}
           </select>
         </div>
       </div>
 
       <div class="admin-card">
         {results.slice(0, 100).map(i => (
-          <div class="ratebook-row" key={i.id}>
+          <div class="ratebook-row" key={i.id} style="grid-template-columns: 70px 1fr 70px 50px 70px;">
             <span class="rb-code">{i.code}</span>
-            <span class="rb-desc">{i.description}</span>
-            <span class="rb-price">{i.basePrice == null ? 'â€”' : i.basePrice}</span>
+            <div style="display:flex;flex-direction:column;gap:4px;">
+              <span class="rb-desc">{i.description}</span>
+              <input
+                placeholder="Amharic description (optional)"
+                value={i.descriptionAm || ''}
+                onInput={e => saveAmharic(i, e.target.value)}
+                style="font-size:0.78rem;padding:2px 6px;border:1px solid var(--border);border-radius:4px;direction:auto;"
+              />
+            </div>
+            <span class="rb-price">{i.basePrice == null ? '—' : i.basePrice}</span>
             <span class="rb-unit">{i.unit}</span>
-            <input type="number" step="any" value={i.contractorPrice == null ? '' : i.contractorPrice} onChange={e => savePrice(i, e.target.value)} />
+            <input
+              type="number" step="any"
+              value={i.contractorPrice == null ? '' : i.contractorPrice}
+              onChange={e => savePrice(i, e.target.value)}
+            />
           </div>
         ))}
-        {results.length === 0 && <div>No items.</div>}
-        {results.length > 100 && <p style="font-size:0.78rem;color:var(--gray);margin-top:8px;">Showing the first 100 of {results.length} matches.</p>}
+        {results.length === 0 && (
+          <div>
+            No items yet.
+            {source === 'goods' && ' Click "Load goods catalog".'}
+            {source === 'works' && ' Click "Reload works".'}
+          </div>
+        )}
+        {results.length > 100 && (
+          <p style="font-size:0.78rem;color:var(--gray);margin-top:8px;">
+            Showing the first 100 of {results.length} matches.
+          </p>
+        )}
       </div>
     </div>
   );
-}
-END
+}END
 cat > src/admin/RequestsTab.jsx << 'END'
 import { useState, useEffect } from 'preact/hooks';
 import { getRequests, saveRequest, deleteRequest } from '../data/requests.js';
@@ -3610,6 +5159,657 @@ export function UsersTab() {
         </div>
       ))}
       {rows && rows.length === 0 && <div class="admin-card">No admins listed.</div>}
+    </div>
+  );
+}END
+cat > src/admin/TendersTab.jsx << 'END'
+import { useState, useEffect, useMemo } from 'preact/hooks';
+import {
+  egpStatus, egpLogin, fetchTenders, normalizeTenderList, normalizeItems,
+  fetchTenderDetail, fetchQuotationItems, fetchResponseItems,
+  fetchQuotationResponse, egpRegister, egpPushPriceOne, egpPushSpecOne,
+} from '../data/egp.js';
+import {
+  saveTenders, getTenders, deleteTender,
+  saveTenderDetail,
+  saveTenderItems,
+} from '../data/tenders.js';
+import {
+  getRateItems, addTenderAlias, createRateItem, getRateCategories,
+} from '../data/ratebook.js';
+import { buildIndex, matchAll } from '../data/match.js';
+
+export function TendersTab({ onCreateProforma }) {
+  const [status, setStatus]   = useState({ isAuthenticated: false, loading: true });
+  const [rows, setRows]       = useState([]);
+  const [search, setSearch]   = useState('Construction');
+  const [top, setTop]         = useState(15);
+  const [busy, setBusy]       = useState(false);
+  const [msg, setMsg]         = useState('');
+  const [error, setError]     = useState('');
+  const [filter, setFilter]   = useState('');
+  const [detail, setDetail]   = useState(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+
+  const loadStored = async () => {
+    try {
+      const all = await getTenders();
+      setRows(all.sort((a,b)=>String(b.invitationDate).localeCompare(String(a.invitationDate))));
+    } catch (e) { setError('DB read failed: ' + e.message); }
+  };
+
+  const refreshStatus = async () => {
+    try {
+      const s = await egpStatus();
+      setStatus({ ...s, loading: false });
+    } catch (e) {
+      setStatus({ isAuthenticated: false, loading: false, error: e.message });
+      setError('Cannot reach /api/egp/status: ' + e.message);
+    }
+  };
+
+  useEffect(() => {
+    refreshStatus();
+    loadStored();
+    const t = setInterval(refreshStatus, 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const login = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await egpLogin();
+      if (!r.success) setError('Login failed: ' + JSON.stringify(r));
+      await refreshStatus();
+    } catch (e) { setError('Login request failed: ' + e.message); }
+    setBusy(false);
+  };
+
+  const doFetch = async () => {
+    setBusy(true); setMsg(''); setError('');
+    try {
+      const raw = await fetchTenders({ search, top });
+      const norm = normalizeTenderList(raw);
+      await saveTenders(norm);
+      await loadStored();
+      setMsg(`Fetched ${raw.total ?? '?'} total · ${norm.length} normalized · saved.`);
+    } catch (e) { setError('Fetch failed: ' + e.message); }
+    setBusy(false);
+  };
+
+  const openTender = async (t) => {
+    setLoadingDetail(true); setError('');
+    try {
+      const d = await fetchTenderDetail(t);
+      const qrid = d.quotationRequestId || d.quatationRequestId || null;
+      let items = [], response = null;
+
+      if (t.sourceApplication === 'Purchasing' && qrid) {
+        try { response = await fetchQuotationResponse(qrid); } catch (e) { console.warn(e); }
+        if (response?.id) {
+          try { items = normalizeItems(await fetchResponseItems(response.id)); } catch (e) { console.warn(e); }
+        }
+        if (items.length === 0) {
+          try { items = normalizeItems(await fetchQuotationItems(qrid)); } catch (e) { console.warn(e); }
+        }
+      }
+
+      await saveTenderDetail({ lotId: t.id, quotationRequestId: qrid, detail: d, items, response, fetchedAt: Date.now() });
+      if (qrid) await saveTenderItems({ key: qrid, lotId: t.id, items, response, fetchedAt: Date.now() });
+      setDetail({ tender: t, detail: d, items, response });
+    } catch (e) { setError('Detail failed: ' + e.message); }
+    setLoadingDetail(false);
+  };
+
+  const removeTender = async (id) => {
+    if (!confirm('Remove this tender from your list?')) return;
+    try { await deleteTender(id); loadStored(); } catch (e) { setError(e.message); }
+  };
+
+  const filtered = useMemo(() => {
+    const s = filter.trim().toLowerCase();
+    if (!s) return rows;
+    return rows.filter(t =>
+      (t.lotName || '').toLowerCase().includes(s) ||
+      (t.procuringEntity || '').toLowerCase().includes(s) ||
+      (t.procurementReferenceNo || '').toLowerCase().includes(s)
+    );
+  }, [rows, filter]);
+
+  return (
+    <div class="admin-panel">
+      <div class="admin-panel-head">
+        <h2>Tenders ({rows.length})</h2>
+        <div class="pf-actions" style="margin:0;">
+          {status.loading
+            ? <span class="pf-status draft">Checking session...</span>
+            : status.isAuthenticated
+              ? <span class="pf-status accepted">{status.name || 'Signed in'} · {Math.round((status.expiresInSeconds||0)/60)}m left</span>
+              : <button class="btn-add" disabled={busy} onClick={login}>{busy ? 'Logging in...' : 'Login to eGP'}</button>}
+        </div>
+      </div>
+
+      {error && <div class="staff-err" style="margin-bottom:12px;">{error}</div>}
+
+      <div class="admin-card">
+        <div class="admin-grid3">
+          <div class="admin-field"><label>Search keyword</label>
+            <input value={search} onInput={e=>setSearch(e.target.value)} /></div>
+          <div class="admin-field"><label>Fetch top N</label>
+            <input type="number" value={top} onInput={e=>setTop(+e.target.value||15)} /></div>
+          <div class="admin-field"><label>&nbsp;</label>
+            <button class="btn-add" disabled={busy || !status.isAuthenticated} onClick={doFetch}>
+              {busy ? 'Fetching...' : 'Fetch from eGP'}
+            </button>
+          </div>
+        </div>
+        {msg && <div class="admin-msg">{msg}</div>}
+      </div>
+
+      <div class="admin-field" style="margin-bottom:12px;">
+        <input placeholder="Filter stored tenders..." value={filter} onInput={e=>setFilter(e.target.value)} />
+      </div>
+
+      {filtered.length === 0 && <div class="admin-card">No tenders yet. Log in, then click <strong>Fetch from eGP</strong>.</div>}
+
+      {filtered.map(t => (
+        <div class="admin-card" key={t.id}>
+          <div class="admin-card-head">
+            <strong style="flex:1;min-width:200px;">{t.lotName}</strong>
+            <span class="pf-status draft">{t.procurementCategory || t.sourceApplication}</span>
+          </div>
+          <div style="font-size:0.84rem;color:var(--gray);">
+            {t.procuringEntity} · Ref {t.procurementReferenceNo}
+            {t.submissionDeadline && ` · Deadline ${String(t.submissionDeadline).slice(0,10)}`}
+          </div>
+          <div class="pf-actions">
+            <button class="btn btn-back" onClick={() => openTender(t)}>
+              {loadingDetail ? '...' : 'View detail'}
+            </button>
+            <button class="btn-del" onClick={() => removeTender(t.id)}>Remove</button>
+          </div>
+        </div>
+      ))}
+
+      {detail && (
+        <TenderDetailModal
+          data={detail}
+          onClose={() => setDetail(null)}
+          onCreateProforma={(payload) => { setDetail(null); onCreateProforma(payload); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function TenderDetailModal({ data, onClose, onCreateProforma }) {
+  const { tender, detail, items: initialItems, response: initialResponse } = data;
+  const li = detail.lotInformation || {};
+  const addr = li.address || {};
+  const qrid = detail.quotationRequestId || detail.quatationRequestId || tender.id;
+
+  const [working, setWorking] = useState(false);
+  const [response, setResponse] = useState(initialResponse);
+  const [items, setItems] = useState(initialItems);
+  const [msg, setMsg] = useState('');
+  const [err, setErr] = useState('');
+  const [matchSummary, setMatchSummary] = useState(null);
+  const [rateIndex, setRateIndex] = useState(null);
+  const [rateCats, setRateCats] = useState([]);
+
+  const [pickerFor, setPickerFor] = useState(null);
+  const [pickerQuery, setPickerQuery] = useState('');
+  const [pickerAm, setPickerAm] = useState('');
+  const [pickerPrice, setPickerPrice] = useState('');
+
+  const isGoodsTender = String(tender.procurementCategory || '').toLowerCase().includes('good');
+  const source = isGoodsTender ? 'goods' : 'works';
+
+  const ensureIndex = async () => {
+    if (rateIndex) return rateIndex;
+    const [ri, rc] = await Promise.all([getRateItems(source), getRateCategories(source)]);
+    const idx = buildIndex(ri);
+    setRateIndex(idx);
+    setRateCats(rc);
+    return idx;
+  };
+
+  const reloadResponse = async () => {
+    try { const r = await fetchQuotationResponse(qrid); setResponse(r); return r; }
+    catch { return null; }
+  };
+
+  const reloadItems = async (responseId) => {
+    if (responseId) {
+      try {
+        const raw = await fetchResponseItems(responseId);
+        const norm = normalizeItems(raw);
+        if (norm.length > 0) { setItems(norm); return norm; }
+      } catch (e) { console.warn(e); }
+    }
+    try {
+      const raw = await fetchQuotationItems(qrid);
+      const norm = normalizeItems(raw);
+      setItems(norm);
+      return norm;
+    } catch { return null; }
+  };
+
+  const doRegister = async () => {
+    setWorking(true); setMsg(''); setErr('');
+    try {
+      const r = await egpRegister(qrid, li.name || tender.lotName);
+      if (r.ok) {
+        setMsg('Registered. Loading items…');
+        const resp = await reloadResponse();
+        let list = await reloadItems(resp?.id);
+        for (let i = 0; i < 3 && (!list || list.length === 0); i++) {
+          await new Promise(res => setTimeout(res, 2000));
+          list = await reloadItems(resp?.id);
+        }
+        setMsg(list && list.length > 0
+          ? `Registered. Loaded ${list.length} items.`
+          : 'Registered. Items not populated yet — try Refresh.');
+      } else {
+        setErr('Register failed: ' + JSON.stringify(r.data));
+      }
+    } catch (e) { setErr('Register error: ' + e.message); }
+    setWorking(false);
+  };
+
+  const refreshItems = async () => {
+    setWorking(true); setMsg(''); setErr('');
+    const list = await reloadItems(response?.id);
+    if (list && list.length > 0) setMsg(`Refreshed: ${list.length} items.`);
+    else setErr('No items returned.');
+    setWorking(false);
+  };
+
+  // ---- Push prices (financial offer) ----
+  const doPushPrices = async () => {
+    if (!response?.id) { setErr('Register first.'); return; }
+    setWorking(true); setMsg(''); setErr('');
+
+    let ok = 0, fail = 0, skip = 0;
+    const failures = [];
+
+    for (const it of items) {
+      if (!it.rate || it.rate <= 0) { skip++; continue; }
+      if (!it.responseItemId) { skip++; continue; }
+
+      const r = await egpPushPriceOne({
+        id: it.responseItemId,
+        quotationRequestResponseId: response.id,
+        quotationRequestId: qrid,
+        lotItemId: it.lotItemId,
+        name: it.name || '',
+        description: it.description || '',
+        quantity: it.qty,
+        currency: 'ETB',
+        unitMeasure: it.unit,
+        unitPrice: it.rate,
+        deliveryTime: null,
+        taxAmount: null,
+        tax: 'VAT',
+      });
+      if (r.ok) ok++;
+      else { fail++; failures.push({ lotItemId: it.lotItemId, status: r.status, body: r.data }); }
+    }
+
+    setMsg(`Prices pushed: ${ok} ok, ${fail} failed, ${skip} skipped.`);
+    if (fail) setErr('Failures: ' + JSON.stringify(failures.slice(0, 2)));
+    setWorking(false);
+  };
+
+  // ---- Push specs (technical offer) ----
+  const doPushSpecs = async () => {
+    if (!response?.id) { setErr('Register first.'); return; }
+    setWorking(true); setMsg(''); setErr('');
+
+    let ok = 0, fail = 0, skip = 0;
+    const failures = [];
+
+    for (const it of items) {
+      if (!it.lotItemId) { skip++; continue; }
+      if (!it.offeredSpecification || !it.offeredSpecification.trim()) { skip++; continue; }
+
+      const r = await egpPushSpecOne({
+        quotationRequestResponseId: response.id,
+        lotItemId: it.lotItemId,
+        offeredSpecification: it.offeredSpecification.trim(),
+      });
+      if (r.ok) ok++;
+      else { fail++; failures.push({ lotItemId: it.lotItemId, status: r.status, body: r.data }); }
+    }
+
+    setMsg(`Specs pushed: ${ok} ok, ${fail} failed, ${skip} skipped.`);
+    if (fail) setErr('Failures: ' + JSON.stringify(failures.slice(0, 2)));
+    setWorking(false);
+  };
+
+  const setRate = (idx, v) => {
+    setItems(items.map((it, i) => i === idx ? { ...it, rate: Math.max(0, parseFloat(v) || 0) } : it));
+  };
+  const setSpec = (idx, v) => {
+    setItems(items.map((it, i) => i === idx ? { ...it, offeredSpecification: v } : it));
+  };
+
+  const fillFromRateBook = async () => {
+    setWorking(true); setMsg(''); setErr(''); setMatchSummary(null);
+    try {
+      setRateIndex(null);
+      const idx = await ensureIndex();
+      if (!idx || idx.length === 0) {
+        setErr(
+          source === 'goods'
+            ? 'Goods catalog is empty. Open Rate Book → Goods → "Load goods catalog" first.'
+            : 'Civil works rate book is empty. Open Rate Book → Works → "Reload works" first.'
+        );
+        setWorking(false); return;
+      }
+      const fresh = items.map(it => ({ ...it, rate: 0, _match: null }));
+      const filled = matchAll(fresh, idx, { minScore: 0.25 });
+      setItems(filled);
+      const matched = filled.filter(x => x._match?.matched).length;
+      const needsManual = filled.filter(x => !x.rate || x.rate === 0).length;
+      setMatchSummary({ matched, total: filled.length, needsManual, source });
+      setMsg(`Matched ${matched} of ${filled.length} items against ${source === 'goods' ? 'Goods' : 'Works'} catalog.`);
+    } catch (e) { setErr('Match failed: ' + e.message); }
+    setWorking(false);
+  };
+
+  const clearRates = () => {
+    setItems(items.map(it => ({ ...it, rate: 0, _match: null })));
+    setMatchSummary(null);
+    setMsg('Cleared all rates.');
+  };
+
+  const openLinkPicker = async (idx) => {
+    await ensureIndex();
+    setPickerFor({ idx, mode: 'link' });
+    setPickerQuery('');
+  };
+  const confirmLink = async (rateItem) => {
+    const row = items[pickerFor.idx];
+    if (!row || !rateItem) { setPickerFor(null); return; }
+    setItems(items.map((it, i) => i === pickerFor.idx
+      ? { ...it, rate: rateItem.contractorPrice || 0, _match: { matched: true, score: 1, source: rateItem, manual: true } }
+      : it));
+    try { await addTenderAlias(rateItem.id, row.description); } catch {}
+    setMsg(`Linked "${row.description.slice(0,40)}…" → ${rateItem.description.slice(0,40)}…`);
+    setRateIndex(null);
+    setPickerFor(null);
+  };
+
+  const openAddPicker = (idx) => {
+    const row = items[idx];
+    setPickerFor({ idx, mode: 'add' });
+    setPickerAm('');
+    setPickerQuery(row?.description || '');
+    setPickerPrice(row?.rate > 0 ? String(row.rate) : '');
+  };
+  const confirmAdd = async () => {
+    const row = items[pickerFor.idx];
+    if (!row) { setPickerFor(null); return; }
+    const desc = pickerQuery.trim() || row.description;
+    const rate = parseFloat(pickerPrice) || 0;
+    if (!desc) { setErr('Description required.'); return; }
+    if (rate <= 0) { setErr('Enter a base price greater than 0.'); return; }
+    try {
+      const created = await createRateItem({
+        description: desc,
+        descriptionAm: pickerAm.trim(),
+        unit: row.unit,
+        rate,
+        categoryId: (isGoodsTender ? 'goods:' : 'works:') + 'custom',
+        source: isGoodsTender ? 'goods' : 'works'
+      });
+      setItems(items.map((it, i) => i === pickerFor.idx
+        ? { ...it, rate, _match: { matched: true, score: 1, source: created, manual: true } }
+        : it));
+      setMsg(`Added "${desc.slice(0,40)}…" @ ${rate}.`);
+      setRateIndex(null);
+      setPickerPrice('');
+    } catch (e) { setErr('Add failed: ' + e.message); }
+    setPickerFor(null);
+  };
+
+  const pickerRow = pickerFor ? items[pickerFor.idx] : null;
+  const pickerResults = useMemo(() => {
+    if (!rateIndex || !pickerFor) return [];
+    const q = pickerQuery.trim().toLowerCase();
+    if (!q) return rateIndex.slice(0, 30);
+    return rateIndex
+      .filter(e =>
+        String(e.item.code).toLowerCase().includes(q) ||
+        String(e.item.description).toLowerCase().includes(q) ||
+        String(e.item.descriptionAm || '').includes(q) ||
+        (e.item.tenderAliases || []).some(a => a.toLowerCase().includes(q))
+      )
+      .slice(0, 30);
+  }, [rateIndex, pickerFor, pickerQuery]);
+
+  const missingResponseItemId = items.some(it => !it.responseItemId && it.rate > 0);
+
+  return (
+    <div class="modal-overlay" onClick={onClose}>
+      <div class="modal" style="max-width:1100px;" onClick={e=>e.stopPropagation()}>
+        <button class="modal-close" onClick={onClose}>X</button>
+        <h2>{li.name || tender.lotName}</h2>
+        <p style="color:var(--gray);font-size:0.88rem;">{li.description}</p>
+        <div class="modal-meta">
+          <span><strong>Entity:</strong> {li.procuring_entity || tender.procuringEntity}</span>
+          <span><strong>Ref:</strong> {li.reference_no || tender.procurementReferenceNo}</span>
+          <span><strong>Deadline:</strong> {li.submission_deadline || tender.submissionDeadline}</span>
+          <span><strong>Town:</strong> {addr.town || '-'}</span>
+          <span><strong>Catalog:</strong> {isGoodsTender ? 'Goods' : 'Works'}</span>
+        </div>
+
+        {response && (
+          <div class="admin-msg" style="margin-top:12px;">
+            Response: <strong>{response.status}</strong> · id <code style="font-size:0.75rem;">{response.id}</code>
+          </div>
+        )}
+
+        <div class="pf-actions" style="margin-top:12px;">
+          <button class="btn-add" disabled={working || items.length === 0} onClick={fillFromRateBook}>
+            {working ? 'Matching...' : 'Match to rate book'}
+          </button>
+          <button class="btn btn-back" disabled={working || items.length === 0} onClick={clearRates}>
+            Clear rates
+          </button>
+          <button class="btn btn-back" disabled={working || !response?.id} onClick={refreshItems}>
+            Refresh items
+          </button>
+          {matchSummary && (
+            <span style="font-size:0.82rem;color:var(--gray);align-self:center;">
+              {matchSummary.matched} matched · {matchSummary.needsManual} need manual entry
+            </span>
+          )}
+        </div>
+
+        {missingResponseItemId && (
+          <div class="admin-msg" style="margin-top:8px;background:#fef3c7;">
+            Some items have no <code>responseItemId</code> — prices can't be pushed for those. Register first, then click <strong>Refresh items</strong>.
+          </div>
+        )}
+
+        <h3 style="margin-top:14px;">Items ({items.length})</h3>
+        {items.length === 0 && <p style="color:var(--gray);font-size:0.85rem;">No items.</p>}
+        {items.length > 0 && (
+          <table class="pf-table">
+            <thead>
+              <tr>
+                <th>Description</th>
+                <th>Unit</th>
+                <th>Qty</th>
+                <th>Offered spec</th>
+                <th>Rate</th>
+                <th>Match</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              {items.map((it, i) => (
+                <tr key={it.responseItemId || it.lotItemId || i}>
+                  <td>{it.description}</td>
+                  <td>{it.unit}</td>
+                  <td>{it.qty}</td>
+                  <td>
+                    <input type="text"
+                      placeholder="Compliant"
+                      value={it.offeredSpecification || ''}
+                      onInput={e => setSpec(i, e.target.value)}
+                      style="width:130px;font-size:0.78rem;" />
+                  </td>
+                  <td>
+                    <input type="number" min="0" step="any" value={it.rate || ''}
+                      onInput={e => setRate(i, e.target.value)}
+                      placeholder="0"
+                      style={{
+                        width: '100px',
+                        background: it._match?.matched ? '#f0fdf4' : (it.rate > 0 ? '#fff' : '#fef3c7')
+                      }} />
+                  </td>
+                  <td style="font-size:0.72rem;color:var(--gray);max-width:180px;">
+                    {it._match?.matched
+                      ? <>
+                          <span title={it._match.source?.description}>
+                            {it._match.manual ? 'manual' : `✓ ${Math.round(it._match.score * 100)}%`}
+                          </span>
+                          <br />
+                          <span style="font-size:0.68rem;" title={it._match.source?.description}>
+                            {(it._match.source?.description || '').slice(0, 40)}
+                            {(it._match.source?.description || '').length > 40 ? '…' : ''}
+                          </span>
+                        </>
+                      : it.rate > 0
+                        ? <span style="color:#92400e;">manual</span>
+                        : <span style="color:#dc2626;">no match</span>}
+                  </td>
+                  <td style="white-space:nowrap;">
+                    <button type="button" class="btn btn-back" style="font-size:0.72rem;padding:3px 8px;"
+                      onClick={() => openLinkPicker(i)}>
+                      Link
+                    </button>
+                    {' '}
+                    <button type="button" class="btn btn-back" style="font-size:0.72rem;padding:3px 8px;"
+                      onClick={() => openAddPicker(i)}>
+                      +New
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {pickerFor && (
+          <div class="admin-card" style="margin-top:14px;border:2px solid var(--primary);">
+            <div class="admin-panel-head" style="margin-bottom:8px;">
+              <strong>
+                {pickerFor.mode === 'link'
+                  ? `Link to ${source === 'goods' ? 'Goods' : 'Works'} catalog`
+                  : `Add new ${source === 'goods' ? 'Goods' : 'Works'} item`}
+              </strong>
+              <button class="btn btn-back" onClick={() => setPickerFor(null)}>Cancel</button>
+            </div>
+            <div style="font-size:0.82rem;color:var(--gray);margin-bottom:8px;">
+              Tender item: <strong>{pickerRow?.description}</strong> · {pickerRow?.unit} · qty {pickerRow?.qty}
+            </div>
+
+            {pickerFor.mode === 'link' && (
+              <>
+                <div class="admin-field">
+                  <label>Search catalog (code, EN, AM, or alias)</label>
+                  <input value={pickerQuery} onInput={e => setPickerQuery(e.target.value)} placeholder="e.g. cement, ሲሚንቶ, 12" />
+                </div>
+                <div style="max-height:260px;overflow-y:auto;border:1px solid var(--border);border-radius:6px;">
+                  {pickerResults.length === 0 && <div style="padding:10px;color:var(--gray);font-size:0.85rem;">No matches.</div>}
+                  {pickerResults.map(e => (
+                    <div key={e.item.id}
+                      style="padding:8px 10px;border-bottom:1px solid var(--border);cursor:pointer;font-size:0.85rem;"
+                      onClick={() => confirmLink(e.item)}
+                      onMouseEnter={ev => ev.currentTarget.style.background = '#f9fafb'}
+                      onMouseLeave={ev => ev.currentTarget.style.background = 'transparent'}
+                    >
+                      <div><strong>{e.item.code || e.item.id}</strong> · {e.item.description}</div>
+                      {e.item.descriptionAm && <div style="color:var(--gray);font-size:0.78rem;">{e.item.descriptionAm}</div>}
+                      <div style="color:var(--gray);font-size:0.74rem;">
+                        {e.item.contractorPrice != null ? e.item.contractorPrice + ' ETB' : '—'} / {e.item.unit}
+                        {e.item.tenderAliases && e.item.tenderAliases.length > 0 && ` · ${e.item.tenderAliases.length} aliases`}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
+
+            {pickerFor.mode === 'add' && (
+              <>
+                <div class="admin-field">
+                  <label>Description (English)</label>
+                  <input value={pickerQuery} onInput={e => setPickerQuery(e.target.value)} />
+                </div>
+                <div class="admin-field">
+                  <label>Description (Amharic, optional)</label>
+                  <input value={pickerAm} onInput={e => setPickerAm(e.target.value)} />
+                </div>
+                <div class="admin-field">
+                  <label>Base price (ETB) *</label>
+                  <input type="number" min="0" step="any"
+                    value={pickerPrice} onInput={e => setPickerPrice(e.target.value)}
+                    placeholder="e.g. 1050" />
+                </div>
+                <div style="font-size:0.82rem;color:var(--gray);margin-bottom:8px;">
+                  Unit: <strong>{pickerRow?.unit}</strong> · Catalog: <strong>{isGoodsTender ? 'Goods' : 'Works'}</strong>
+                </div>
+                <button class="btn-add" onClick={confirmAdd}>Create in Custom category</button>
+              </>
+            )}
+          </div>
+        )}
+
+        {msg && <div class="admin-msg" style="margin-top:8px;">{msg}</div>}
+        {err && <div class="staff-err" style="margin-top:8px;">{err}</div>}
+
+        <div class="pf-actions" style="margin-top:14px;">
+          {!response && tender.sourceApplication === 'Purchasing' && (
+            <button class="btn-add" disabled={working} onClick={doRegister}>
+              {working ? 'Registering...' : 'Register on eGP'}
+            </button>
+          )}
+
+          {response && (
+            <>
+              <button class="btn-add" disabled={working || items.length === 0} onClick={doPushSpecs}>
+                {working ? '...' : 'Push specs (technical)'}
+              </button>
+              <button class="btn-add" disabled={working || items.length === 0} onClick={doPushPrices}>
+                {working ? '...' : 'Push prices (financial)'}
+              </button>
+            </>
+          )}
+
+          <button class="btn btn-primary" disabled={items.length === 0}
+            onClick={() => onCreateProforma({
+              tender,
+              detail: li,
+              items: items.map(it => ({
+                lotItemId: it.lotItemId,
+                name: it.name,
+                description: it.description,
+                unit: it.unit,
+                qty: it.qty,
+                rate: it.rate || 0,
+              })),
+            })}>
+            Create Proforma
+          </button>
+
+          <button class="btn btn-back" onClick={onClose}>Close</button>
+        </div>
+      </div>
     </div>
   );
 }END
