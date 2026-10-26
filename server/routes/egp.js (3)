@@ -1,0 +1,97 @@
+import { Router } from 'express';
+import {
+  doPasswordLogin, doRefresh, status, egpGet, egpRequest,
+} from '../egpAuth.js';
+
+const r = Router();
+
+// ---- Auth ----
+r.post('/login',   async (_req, res) => res.json({ success: await doPasswordLogin(), ...status() }));
+r.post('/refresh', async (_req, res) => res.json({ success: await doRefresh(), ...status() }));
+r.get ('/status',  (_req, res) => res.json(status()));
+
+// ---- Tender list (raw query passthrough) ----
+r.get('/tenders', async (req, res) => {
+  const qs = req.originalUrl.split('?')[1] || '';
+  const p = '/po-gw/cms-v2/api/sourcing/get-grouped-sourcing' + (qs ? '?' + qs : '');
+  const { status: s, body } = await egpGet(p);
+  res.status(s).json(body);
+});
+
+// ---- Tender detail (branch by ?source=purchasing|tendering) ----
+r.get('/tender/:id', async (req, res) => {
+  const { id } = req.params;
+  const source = String(req.query.source || '').toLowerCase();
+  const p = source === 'purchasing'
+    ? `/po-gw/federal/purchasing/api/quotation-invitations/get-quotation-invitation/${id}`
+    : `/po-gw/cms-v2/api/sourcing/get-lot/${id}`;
+  const { status: s, body } = await egpGet(p);
+  res.status(s).json(body);
+});
+
+// ---- Items for a quotation ----
+r.get('/tender/:quotationRequestId/items', async (req, res) => {
+  const p = '/po-gw/federal/purchasing/api/quotation-requests/get-quotation-request-items-by-quotation-request-id/'
+          + req.params.quotationRequestId;
+  const { status: s, body } = await egpGet(p);
+  res.status(s).json(body);
+});
+
+// ---- Registered response ----
+r.get('/tender/:quotationRequestId/response', async (req, res) => {
+  const p = '/po-gw/federal/purchasing/api/quotation-request-responses/get-public-quotation-request-response-v2/'
+          + req.params.quotationRequestId;
+  const { status: s, body } = await egpGet(p);
+  res.status(s).json(body);
+});
+
+// ---- Register ----
+r.post('/register', async (req, res) => {
+  const { quotationRequestId, quotationRequestName } = req.body || {};
+  if (!quotationRequestId || !quotationRequestName) {
+    return res.status(400).json({ error: 'quotationRequestId + quotationRequestName required' });
+  }
+  const { status: s, body } = await egpRequest(
+    'POST',
+    '/po-gw/federal/purchasing/api/quotation-request-registrations/create-quotation-request-registration',
+    { quatationRequestId: quotationRequestId, quatationRequestName: quotationRequestName }
+  );
+  res.status(s).json(body);
+});
+
+// ---- Add items to response ----
+r.post('/add-items', async (req, res) => {
+  const { quotationRequestResponseId, items } = req.body || {};
+  if (!quotationRequestResponseId || !Array.isArray(items)) {
+    return res.status(400).json({ error: 'quotationRequestResponseId + items[] required' });
+  }
+  const payload = {
+    quotationRequestResponseId,
+    quotationRequestResponseItems: items.map(it => ({
+      quotationRequestResponseId,
+      lotItemId:   it.lotItemId,
+      name:        it.name || '',
+      description: it.description || '',
+      quantity:    it.quantity ?? it.qty ?? 0,
+      unitMeasure: it.unitMeasure || it.unit || '',
+    })),
+  };
+  const { status: s, body } = await egpRequest(
+    'POST',
+    '/po-gw/federal/purchasing/api/quotation-request-responses/add-quotation-request-response-item',
+    payload
+  );
+  res.status(s).json(body);
+});
+
+// ---- Submit ----
+r.post('/submit/:responseId', async (req, res) => {
+  const { status: s, body } = await egpRequest(
+    'POST',
+    `/po-gw/federal/purchasing/api/quotation-request-responses/submit-quotation-request-response/${req.params.responseId}`,
+    {}
+  );
+  res.status(s).json(body);
+});
+
+export default r;

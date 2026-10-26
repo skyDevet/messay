@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 500" width="800" height="500" role="img" aria-label="Before placeholder">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#9ca3af"/>
+      <stop offset="1" stop-color="#6b7280"/>
+    </linearGradient>
+  </defs>
+  <rect width="800" height="500" fill="url(#bg)"/>
+  <rect x="120" y="260" width="560" height="160" fill="#4b5563"/>
+  <rect x="180" y="210" width="120" height="50" fill="#4b5563"/>
+  <path d="M120 260 L400 130 L680 260 Z" fill="#374151"/>
+  <circle cx="650" cy="90" r="34" fill="#e5e7eb" opacity="0.7"/>
+  <text x="400" y="470" text-anchor="middle" font-family="Arial, Helvetica, sans-serif" font-size="34" font-weight="700" fill="#f3f4f6" letter-spacing="6">BEFORE</text>
+</svg>

@@ -1,0 +1,100 @@
+import { useState, useEffect, useMemo } from 'preact/hooks';
+import { useStore } from '../data/store.js';
+import {
+  getRateBookMeta, getRateCategories, getRateItems, updateRateItem,
+  applyInflation, resetContractorPrices, seedFromModule
+} from '../data/ratebook.js';
+
+export function RateBookTab() {
+  const [data] = useStore();
+  const [meta, setMeta] = useState(null);
+  const [cats, setCats] = useState([]);
+  const [items, setItems] = useState([]);
+  const [cat, setCat] = useState('all');
+  const [q, setQ] = useState('');
+  const [factor, setFactor] = useState(String(data.business.inflationFactor || 1));
+  const [alsoContractor, setAlsoContractor] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  const load = async () => {
+    setMeta(await getRateBookMeta());
+    setCats(await getRateCategories());
+    setItems(await getRateItems());
+  };
+  useEffect(() => { load(); }, []);
+
+  const results = useMemo(() => {
+    const s = q.trim().toLowerCase();
+    return items.filter(i =>
+      (cat === 'all' || i.categoryId === cat) &&
+      (!s || String(i.code).toLowerCase().includes(s) || String(i.description).toLowerCase().includes(s))
+    );
+  }, [items, cat, q]);
+
+  const savePrice = async (item, raw) => {
+    const v = raw === '' ? null : parseFloat(raw);
+    await updateRateItem(item.id, { contractorPrice: v });
+    setItems(items.map(i => i.id === item.id ? Object.assign({}, i, { contractorPrice: v }) : i));
+  };
+  const inflate = async () => {
+    const f = parseFloat(factor);
+    if (!f || f <= 0) { setMsg('Enter a valid factor, e.g. 1.05'); return; }
+    if (!confirm('Multiply all base prices by ' + f + '?')) return;
+    const n = await applyInflation(f, alsoContractor);
+    setMsg('Updated ' + n + ' items.'); load();
+  };
+  const resetPrices = async () => {
+    if (!confirm('Reset every contractor price to its base price?')) return;
+    const n = await resetContractorPrices();
+    setMsg('Reset ' + n + ' items.'); load();
+  };
+  const reseed = async () => {
+    if (!confirm('Reload the bundled rate book? This replaces all rate book items and edits.')) return;
+    const r = await seedFromModule();
+    setMsg('Loaded ' + r.itemCount + ' items in ' + r.categoryCount + ' categories.'); load();
+  };
+
+  return (
+    <div class="admin-panel">
+      <div class="admin-panel-head">
+        <h2>Rate Book ({items.length} items)</h2>
+        <button class="btn-add" onClick={reseed}>Reload bundled rate book</button>
+      </div>
+      {meta && <div class="admin-card" style="font-size:0.85rem;color:var(--gray);">{meta.document || meta.source} {meta.quarter} Â· {meta.currency} Â· imported {String(meta.importedAt).slice(0, 10)}</div>}
+      {msg && <div class="admin-msg">{msg}</div>}
+
+      <div class="admin-card">
+        <div class="admin-grid3">
+          <div class="admin-field"><label>Inflation factor</label><input type="number" step="any" value={factor} onInput={e => setFactor(e.target.value)} /></div>
+          <div class="admin-field"><label>Also set contractor price</label><select value={alsoContractor ? 'yes' : 'no'} onChange={e => setAlsoContractor(e.target.value === 'yes')}><option value="no">No</option><option value="yes">Yes</option></select></div>
+          <div class="admin-field"><label>&nbsp;</label><button class="btn-add" onClick={inflate}>Apply</button></div>
+        </div>
+        <button class="btn-del" onClick={resetPrices}>Reset contractor prices</button>
+      </div>
+
+      <div class="admin-grid2">
+        <div class="admin-field"><label>Search</label><input value={q} onInput={e => setQ(e.target.value)} placeholder="Code or description" /></div>
+        <div class="admin-field"><label>Category</label>
+          <select value={cat} onChange={e => setCat(e.target.value)}>
+            <option value="all">All categories</option>
+            {cats.map(c => <option value={c.id}>{c.id}. {c.title}</option>)}
+          </select>
+        </div>
+      </div>
+
+      <div class="admin-card">
+        {results.slice(0, 100).map(i => (
+          <div class="ratebook-row" key={i.id}>
+            <span class="rb-code">{i.code}</span>
+            <span class="rb-desc">{i.description}</span>
+            <span class="rb-price">{i.basePrice == null ? 'â€”' : i.basePrice}</span>
+            <span class="rb-unit">{i.unit}</span>
+            <input type="number" step="any" value={i.contractorPrice == null ? '' : i.contractorPrice} onChange={e => savePrice(i, e.target.value)} />
+          </div>
+        ))}
+        {results.length === 0 && <div>No items.</div>}
+        {results.length > 100 && <p style="font-size:0.78rem;color:var(--gray);margin-top:8px;">Showing the first 100 of {results.length} matches.</p>}
+      </div>
+    </div>
+  );
+}

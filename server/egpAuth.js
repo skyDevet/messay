@@ -1,0 +1,272 @@
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+
+const CONFIG = {
+  USERNAME: process.env.EGP_USERNAME || 'Mesaya496@gmail.com',
+  PASSWORD: process.env.EGP_PASSWORD || 'Mesay@123',
+  TOKEN_URL: 'https://production.egp.gov.et/auth/connect/token',
+  API_BASE: 'https://production.egp.gov.et',
+  SCOPE: 'openid profile email offline_access erp_api',
+  CLIENT_ID: 'skoruba_identity_admin',
+  CLIENT_SECRET: 'skoruba_admin_client_secret',
+  VISITOR_ID: process.env.EGP_VISITOR_ID || 'ce01e0a13c0cf55d99d8710d8b941c85',
+  HMAC_SECRET: 'xlpJ2QI0pvOtZkBN5WlL',
+  SESSION_FILE: path.resolve('server/egp_session.json'),
+  REFRESH_MARGIN: 120,
+  REFRESH_CHECK_MS: 30_000,
+  REQUEST_TIMEOUT_MS: 15_000,
+  MAX_RETRIES: 2,
+  RETRY_DELAY_MS: 1_000,
+};
+
+const session = {
+  access_token: null, refresh_token: null, id_token: null,
+  token_type: null, expires_in: null, expires_at: null, scope: null,
+  profile: null, org: null, isAuthenticated: false,
+  capturedAt: null, lastRefresh: null, refreshCount: 0,
+};
+
+const now = () => Math.floor(Date.now() / 1000);
+
+function decodeJwt(t) {
+  try {
+    const p = t.split('.')[1].replace(/-/g, '+').replace(/_/g, '/');
+    return JSON.parse(Buffer.from(p, 'base64').toString('utf8'));
+  } catch { return null; }
+}
+
+function saveSession() {
+  try { fs.writeFileSync(CONFIG.SESSION_FILE, JSON.stringify(session, null, 2)); }
+  catch (e) { console.warn('[egp] save fail:', e.message); }
+}
+function loadSession() {
+  try {
+    if (fs.existsSync(CONFIG.SESSION_FILE))
+      Object.assign(session, JSON.parse(fs.readFileSync(CONFIG.SESSION_FILE, 'utf8')));
+  } catch {}
+}
+
+function applyToken(body) {
+  session.access_token = body.access_token;
+  session.refresh_token = body.refresh_token || session.refresh_token;
+  session.id_token = body.id_token;
+  session.token_type = body.token_type;
+  session.expires_in = body.expires_in;
+  session.scope = body.scope;
+  session.expires_at = now() + Number(body.expires_in || 0);
+  session.isAuthenticated = true;
+
+  const p = decodeJwt(session.access_token) || {};
+  const prof = p.profile || {};
+  session.profile = {
+    sub: p.sub, name: p.name, email: prof.email,
+    firstName: prof.firstName?.en, lastName: prof.lastName?.en,
+  };
+}
+
+const formHeaders = () => ({
+  'Content-Type': 'application/x-www-form-urlencoded',
+  Accept: 'application/json, text/plain, */*',
+  'X-Application-Key': 'landing',
+});
+
+// Fetch with timeout + retry; throws only after all retries exhausted
+async function robustFetch(url, init = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < CONFIG.MAX_RETRIES; attempt++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), CONFIG.REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(url, { ...init, signal: ctl.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      const code = e?.cause?.code || e?.name || e?.message || 'error';
+      console.warn(`[egp] fetch attempt ${attempt + 1}/${CONFIG.MAX_RETRIES} failed: ${code}`);
+      if (attempt < CONFIG.MAX_RETRIES - 1) {
+        await new Promise(r => setTimeout(r, CONFIG.RETRY_DELAY_MS));
+      }
+    }
+  }
+  throw lastErr;
+}
+
+function errMessage(e) {
+  return e?.cause?.code || e?.cause?.message || e?.name || e?.message || 'network error';
+}
+
+export async function doPasswordLogin() {
+  const body = new URLSearchParams({
+    grant_type: 'password', scope: CONFIG.SCOPE,
+    username: CONFIG.USERNAME, password: CONFIG.PASSWORD,
+    client_id: CONFIG.CLIENT_ID, client_secret: CONFIG.CLIENT_SECRET,
+  });
+  try {
+    const r = await robustFetch(CONFIG.TOKEN_URL, { method: 'POST', headers: formHeaders(), body });
+    const json = await r.json().catch(() => ({}));
+    if (r.status !== 200 || !json.access_token) {
+      console.warn('[egp] login failed', r.status, json);
+      return false;
+    }
+    applyToken(json);
+    session.capturedAt = new Date().toISOString();
+    saveSession();
+    console.log('[egp] login ok, expires_in', session.expires_in);
+    return true;
+  } catch (e) { console.warn('[egp] login exc:', errMessage(e)); return false; }
+}
+
+export async function doRefresh() {
+  if (!session.refresh_token) return false;
+  const body = new URLSearchParams({
+    grant_type: 'refresh_token', refresh_token: session.refresh_token,
+    client_id: CONFIG.CLIENT_ID, client_secret: CONFIG.CLIENT_SECRET,
+    scope: CONFIG.SCOPE,
+  });
+  try {
+    const r = await robustFetch(CONFIG.TOKEN_URL, { method: 'POST', headers: formHeaders(), body });
+    const json = await r.json().catch(() => ({}));
+    if (r.status !== 200 || !json.access_token) {
+      console.warn('[egp] refresh failed', r.status, json);
+      return false;
+    }
+    applyToken(json);
+    session.lastRefresh = new Date().toISOString();
+    session.refreshCount += 1;
+    saveSession();
+    console.log('[egp] refreshed, count', session.refreshCount);
+    return true;
+  } catch (e) { console.warn('[egp] refresh exc:', errMessage(e)); return false; }
+}
+
+export function status() {
+  const rem = (session.expires_at || 0) - now();
+  return {
+    isAuthenticated: session.isAuthenticated,
+    hasToken: !!session.access_token,
+    expiresAt: session.expires_at,
+    expiresInSeconds: Math.max(rem, 0),
+    refreshCount: session.refreshCount,
+    lastRefresh: session.lastRefresh,
+    capturedAt: session.capturedAt,
+    name: session.profile?.name || null,
+    org: session.org,
+  };
+}
+
+function signingPath(pathname) {
+  const i = pathname.indexOf('/api');
+  return i === -1 ? pathname : pathname.slice(i);
+}
+
+function buildHmac(method, fullUrl) {
+  const u = new URL(fullUrl);
+  const m  = (method || 'POST').toUpperCase();
+  const p  = signingPath(u.pathname);
+  const q  = u.search.startsWith('?') ? u.search.slice(1) : u.search;
+  const q_ = q ? '?' + q : '';
+  const ts = String(Math.floor(Date.now() / 1000));
+  const nonce = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const canonical = [m, p, q_, ts, nonce].join('\n');
+  const sig = crypto.createHmac('sha256', CONFIG.HMAC_SECRET).update(canonical).digest('base64');
+  return {
+    'X-Hmac-Signature': sig,
+    'X-Hmac-Timestamp': ts,
+    'X-Hmac-Nonce':     nonce,
+  };
+}
+
+function baseHeaders() {
+  return {
+    Authorization: `Bearer ${session.access_token}`,
+    Accept: 'application/json, text/plain, */*',
+    'X-Application-Key': 'landing',
+    'X-Visitor-Id': CONFIG.VISITOR_ID,
+    'X-Organization-Id': '5b861f3c-e466-4453-8980-43d8dd05f5c7',
+    'X-Personnel-Id':    'c5fcfc56-4538-4bfe-ba0d-940134288a33',
+    'X-Placement-Id':    'e846dd88-20bb-4e6c-b4b5-d20e83b7765e',
+    'X-Unit-Id':         '5b861f3c-e466-4453-8980-43d8dd05f5c7',
+  };
+}
+
+export async function egpGet(pathname) {
+  if (!session.access_token) {
+    if (!(await doPasswordLogin())) return { status: 401, body: { error: 'not authenticated' } };
+  }
+  const url = CONFIG.API_BASE + pathname;
+
+  const doFetch = () => robustFetch(url, { headers: baseHeaders() });
+
+  try {
+    let r = await doFetch();
+    if (r.status === 401 && (await doRefresh())) r = await doFetch();
+
+    const text = await r.text();
+    let parsed; try { parsed = JSON.parse(text); } catch { parsed = { _raw: text.slice(0, 2000) }; }
+    return { status: r.status, body: parsed };
+  } catch (e) {
+    const msg = errMessage(e);
+    console.warn('[egp] egpGet failed:', msg);
+    return { status: 0, body: { error: 'eGP unreachable: ' + msg } };
+  }
+}
+
+export async function egpRequest(method, pathname, body) {
+  if (!session.access_token) {
+    if (!(await doPasswordLogin())) return { status: 401, body: { error: 'not authenticated' } };
+  }
+  const url = CONFIG.API_BASE + pathname;
+  const m = method.toUpperCase();
+
+  const doFetch = () => {
+    const headers = baseHeaders();
+    headers['Content-Type'] = 'application/json';
+    if (m !== 'GET') Object.assign(headers, buildHmac(m, url));
+    return robustFetch(url, {
+      method: m,
+      headers,
+      body: body != null ? (typeof body === 'string' ? body : JSON.stringify(body)) : undefined,
+    });
+  };
+
+  try {
+    let r = await doFetch();
+    if (r.status === 401 && (await doRefresh())) r = await doFetch();
+
+    const text = await r.text();
+    let parsed; try { parsed = JSON.parse(text); } catch { parsed = { _raw: text.slice(0, 2000) }; }
+    return { status: r.status, body: parsed };
+  } catch (e) {
+    const msg = errMessage(e);
+    console.warn(`[egp] egpRequest ${m} ${pathname} failed:`, msg);
+    return { status: 0, body: { error: 'eGP unreachable: ' + msg } };
+  }
+}
+
+export function startRefreshWorker() {
+  setInterval(async () => {
+    if (!session.isAuthenticated) return;
+    const rem = (session.expires_at || 0) - now();
+    if (rem <= CONFIG.REFRESH_MARGIN) {
+      console.log(`[egp] token expires in ${rem}s, refreshing`);
+      if (!(await doRefresh()) && !(await doPasswordLogin())) {
+        console.warn('[egp] refresh + login both failed');
+      }
+    }
+  }, CONFIG.REFRESH_CHECK_MS).unref?.();
+}
+
+export async function bootstrap() {
+  loadSession();
+  if (session.refresh_token) {
+    console.log('[egp] bootstrapping from stored refresh_token');
+    if (!(await doRefresh())) await doPasswordLogin();
+  } else {
+    console.log('[egp] no stored session, will log in on first call');
+  }
+  startRefreshWorker();
+}

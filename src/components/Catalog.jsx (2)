@@ -1,0 +1,47 @@
+import { useState } from 'preact/hooks';
+import { useStore } from '../data/store.js';
+export function Catalog({ cart, setCart, onRequest }) {
+  const [data, lang] = useStore();
+  const [active, setActive] = useState('all');
+  const list = active === 'all' ? data.products : data.products.filter(p => p.category === active);
+  const inCart = (id) => cart.find(c => c.sku === id);
+  const add = (p) => {
+    const existing = inCart(p.id);
+    if (existing) setCart(cart.map(c => c.sku === p.id ? Object.assign({}, c, { qty: c.qty + 1 }) : c));
+    else setCart([...cart, { sku: p.id, name: p.name, unit: p.unit, qty: 1 }]);
+  };
+  const remove = (id) => setCart(cart.filter(c => c.sku !== id));
+  const setQty = (id, q) => setCart(cart.map(c => c.sku === id ? Object.assign({}, c, { qty: Math.max(1, +q || 1) }) : c));
+  return (
+    <section class="section" id="catalog"><div class="container">
+      <div class="section-header">
+        <h2>{lang === 'am' ? 'የቁሳቁስ ዝርዝር' : 'Materials Catalog'}</h2>
+        <p>{lang === 'am' ? 'የሚፈልጉትን ይምረጡ እና ዋጋ ይጠይቁ።' : 'Select items and request a quote.'}</p>
+      </div>
+      <div class="filters">
+        <button class={'filter-btn ' + (active === 'all' ? 'active' : '')} onClick={() => setActive('all')}>{lang === 'am' ? 'áˆáˆ‰áˆ' : 'All'}</button>
+        {data.categories.map(c => (<button class={'filter-btn ' + (active === c.id ? 'active' : '')} onClick={() => setActive(c.id)}>{c.icon} {lang === 'am' ? c.nameAm : c.name}</button>))}
+      </div>
+      <div class="catalog-grid">
+        {list.map(p => {
+          const added = inCart(p.id);
+          const cat = data.categories.find(c => c.id === p.category);
+          return (
+            <div class="product-card">
+              <div class="product-img"><span class="product-cat">{cat ? (lang === 'am' ? cat.nameAm : cat.name) : p.category}</span><span class="product-icon">{cat ? cat.icon : 'ðŸ“¦'}</span></div>
+              <div class="product-info"><h3>{p.name}</h3>
+                <div class="product-meta"><span>per {p.unit}</span><span>Stock: {p.stock}</span></div>
+                <div class="product-actions">
+                  {added ? (<><input type="number" min="1" value={added.qty} onInput={e => setQty(p.id, e.target.value)} /><button class="btn-add-cart" onClick={() => remove(p.id)}>Remove</button></>) : (<button class="btn-add-cart" style="width:100%;" onClick={() => add(p)}>+ {lang === 'am' ? 'á‹ˆá‹° á‹áˆ­á‹áˆ­ áŒ¨áˆáˆ­' : 'Add to Request List'}</button>)}
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {cart.length > 0 && (
+        <div class="cart-summary"><strong>{cart.length} item{cart.length > 1 ? 's' : ''}</strong> in your request list<button class="btn btn-primary" style="margin-left: 12px;" onClick={onRequest}>Continue to Request â†’</button></div>
+      )}
+    </div></section>
+  );
+}

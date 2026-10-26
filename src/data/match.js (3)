@@ -1,0 +1,138 @@
+// Bilingual (English + Amharic) fuzzy matcher for rate-book lookup.
+
+const STOP_EN = new Set([
+  'of','and','the','for','with','to','from','on','in','at','by','or','a','an',
+  'pcs','each','unit','no','nos','type','size','dia','mm','cm','m','kg','ton','tone',
+  'thick','inch','in'
+]);
+
+const STOP_AM = new Set([
+  'እና','ወይም','ከ','ለ','በ','የ','ላይ','ውስጥ','ጋር','ነው','ና','ም','ን','ኦ','፣','።'
+]);
+
+const UNIT_SYNONYMS = {
+  'pcs': 'each', 'nos': 'each', 'no': 'each',
+  'quintal': 'quintal', 'qtl': 'quintal',
+  'ton': 'ton', 'tone': 'ton', 't': 'ton',
+  'm3': 'm³', 'm³': 'm³', 'cum': 'm³',
+  'm2': 'm²', 'm²': 'm²', 'sqm': 'm²',
+  'ml': 'ml', 'lm': 'ml',
+  'kg': 'kg'
+};
+
+// ---------- Tokenizers ----------
+
+function tokenizeEn(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(t => t.length > 1 && !STOP_EN.has(t));
+}
+
+function tokenizeAm(text) {
+  return String(text || '')
+    .replace(/[^\u1200-\u137F\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(t => t.length > 1 && !STOP_AM.has(t));
+}
+
+function normUnit(u) {
+  const k = String(u || '').toLowerCase().trim();
+  return UNIT_SYNONYMS[k] || k;
+}
+
+// Jaccard similarity
+function scoreTokens(a, b) {
+  const aSet = new Set(a), bSet = new Set(b);
+  let inter = 0;
+  for (const t of aSet) if (bSet.has(t)) inter++;
+  if (inter === 0) return 0;
+  const union = aSet.size + bSet.size - inter;
+  return inter / union;
+}
+
+// ---------- Index ----------
+
+export function buildIndex(rateItems) {
+  return rateItems.map(r => ({
+    item: r,
+    tokensEn: tokenizeEn(r.description),
+    tokensAm: r.descriptionAm ? tokenizeAm(r.descriptionAm) : [],
+    unit: normUnit(r.unit),
+    lowerEn: String(r.description || '').toLowerCase(),
+    lowerAm: String(r.descriptionAm || '').toLowerCase()
+  }));
+}
+
+// ---------- Single match ----------
+
+/**
+ * Match a tender item against the index.
+ * Tries Amharic-first when the tender item looks Amharic, otherwise English.
+ * If the tender is Amharic but rate-book item has no Amharic, falls back to
+ * English tokens of the tender (rare — most tender fields are one language).
+ */
+export function matchOne(tenderItem, index, opts = {}) {
+  const minScore = opts.minScore ?? 0.45;
+  const rawDesc = tenderItem.description || tenderItem.name || '';
+  const tEn = tokenizeEn(rawDesc);
+  const tAm = tokenizeAm(rawDesc);
+  const tUnit = normUnit(tenderItem.unit || tenderItem.unitMeasure);
+
+  const isAmharic = tAm.length > 0 && tEn.length < tAm.length;
+
+  let best = null;
+  for (const entry of index) {
+    if (!entry.item.contractorPrice) continue;
+    if (entry.unit && tUnit && entry.unit !== tUnit) continue;
+
+    let s = 0;
+
+    if (isAmharic && entry.tokensAm.length > 0) {
+      s = scoreTokens(tAm, entry.tokensAm);
+      const tStr = tAm.join(' ');
+      if (tStr.length >= 4 && entry.lowerAm.includes(tStr)) s = Math.min(1, s + 0.35);
+    } else if (entry.tokensEn.length > 0) {
+      s = scoreTokens(tEn, entry.tokensEn);
+      const tStr = tEn.join(' ');
+      if (tStr.length >= 6 && entry.lowerEn.includes(tStr)) s = Math.min(1, s + 0.35);
+    } else if (isAmharic && entry.tokensEn.length === 0 && entry.tokensAm.length === 0) {
+      continue;
+    }
+
+    if (!best || s > best.score) best = { score: s, entry };
+  }
+
+  if (!best || best.score < minScore) {
+    return { rate: 0, matched: false, score: best ? best.score : 0 };
+  }
+  return {
+    rate: best.entry.item.contractorPrice,
+    matched: true,
+    score: best.score,
+    matchItem: best.entry.item
+  };
+}
+
+// ---------- Bulk match ----------
+
+export function matchAll(tenderItems, index, opts) {
+  return tenderItems.map(it => {
+    if (it.rate > 0) return it;
+    const m = matchOne(it, index, opts);
+    return {
+      ...it,
+      rate: m.rate,
+      _match: {
+        matched: m.matched,
+        score: m.score,
+        source: m.matchItem
+      }
+    };
+  });
+}

@@ -1,0 +1,99 @@
+// Fuzzy matcher: find the best rate-book item for a tender description.
+// Handles tokenization, stop-words, unit hints, and score thresholding.
+
+const STOP = new Set([
+  'of','and','the','for','with','to','from','on','in','at','by','or','a','an',
+  'pcs','each','unit','no','nos','type','size','dia','mm','cm','m','kg','ton','tone'
+]);
+
+const UNIT_SYNONYMS = {
+  'pcs': 'each', 'nos': 'each', 'no': 'each',
+  'quintal': 'quintal', 'qtl': 'quintal',
+  'ton': 'ton', 'tone': 'ton', 't': 'ton',
+  'm3': 'm³', 'm³': 'm³', 'cum': 'm³',
+  'm2': 'm²', 'm²': 'm²', 'sqm': 'm²',
+  'ml': 'ml', 'lm': 'ml',
+  'kg': 'kg',
+};
+
+function tokenize(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9.]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .split(' ')
+    .filter(t => t.length > 1 && !STOP.has(t));
+}
+
+function normUnit(u) {
+  const k = String(u || '').toLowerCase().trim();
+  return UNIT_SYNONYMS[k] || k;
+}
+
+// Jaccard-ish overlap weighted by token rarity in the corpus
+function scoreMatch(aTokens, bTokens) {
+  const aSet = new Set(aTokens);
+  const bSet = new Set(bTokens);
+  let inter = 0;
+  for (const t of aSet) if (bSet.has(t)) inter++;
+  if (inter === 0) return 0;
+  const union = aSet.size + bSet.size - inter;
+  return inter / union;
+}
+
+export function buildIndex(rateItems) {
+  return rateItems.map(r => ({
+    item: r,
+    tokens: tokenize(r.description),
+    unit: normUnit(r.unit),
+    lower: String(r.description || '').toLowerCase(),
+  }));
+}
+
+/**
+ * Match a single tender item against the rate-book index.
+ * Returns { rate, matched, matchItem, score } or { rate: 0, matched: false }.
+ */
+export function matchOne(tenderItem, index, opts = {}) {
+  const minScore = opts.minScore ?? 0.45;
+  const tTokens = tokenize(tenderItem.description || tenderItem.name || '');
+  if (tTokens.length === 0) return { rate: 0, matched: false, score: 0 };
+  const tUnit = normUnit(tenderItem.unit);
+
+  let best = null;
+  for (const entry of index) {
+    if (!entry.item.contractorPrice) continue;
+    if (entry.unit && tUnit && entry.unit !== tUnit) continue;
+
+    // Fast prefix shortcut: exact substring wins big
+    let s = scoreMatch(tTokens, entry.tokens);
+    const tStr = tTokens.join(' ');
+    if (tStr.length >= 6 && entry.lower.includes(tStr)) s = Math.min(1, s + 0.35);
+    // Unit-token bonus
+    if (tTokens.some(t => entry.tokens.includes(t))) s += 0.02;
+
+    if (!best || s > best.score) best = { score: s, entry };
+  }
+
+  if (!best || best.score < minScore) {
+    return { rate: 0, matched: false, score: best ? best.score : 0 };
+  }
+  return {
+    rate: best.entry.item.contractorPrice,
+    matched: true,
+    score: best.score,
+    matchItem: best.entry.item,
+  };
+}
+
+/**
+ * Bulk match: returns tender items with `rate` filled and `_match` metadata.
+ */
+export function matchAll(tenderItems, index, opts) {
+  return tenderItems.map(it => {
+    if (it.rate > 0) return it; // already has a price, don't override
+    const m = matchOne(it, index, opts);
+    return { ...it, rate: m.rate, _match: { matched: m.matched, score: m.score, source: m.matchItem } };
+  });
+}

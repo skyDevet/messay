@@ -1,0 +1,132 @@
+import { useState, useEffect } from 'preact/hooks';
+import { saveBusinessInfo, getBusinessInfo } from './business.js';
+
+const KEY = 'mesay_data_v2';
+
+export const DEFAULT_DATA = {
+  business: {
+    nameEn: 'Mesay Abebe General Contractor',
+    nameAm: 'መሳይ አበበ አጠቃላይ ተቋራጭ G5',
+    taglineEn: 'General Contractor G5 · Building, Road & Renovation',
+    taglineAm: 'አጠቃላይ ተቋራጭ (511114) · ህንፃ፣ መንገድ እና ማሻሻያ',
+    subtitleEn: 'Building construction, road works, renovation — plus construction materials delivered to your site.',
+    subtitleAm: 'በአዲስ አበባ ጉለሌ ክፍለ ከተማ የተመዘገበ አጠቃላይ ተቋራጭ።',
+    ownerName: 'Mr. MESAY ABEBE BAHIRE',
+    fieldOfBusiness: 'General Contractor Except water work',
+    businessLicenseNo: 'GU/AA/14/668/717216/2010',
+    principalRegNo: 'GU/AA/1/0006440/2009',
+    previousLicenseNo: '980/2016',
+    tin: '0054073141',
+    capital: 'ETB 500,000.00',
+    dateOfIssuance: '18/4/2010',
+    renewalDate: '3/10/2018',
+    businessLicenseIssued: '6/10/2026',
+    bureau: 'Addis Ababa City Administration Trade Bureau',
+    cell1: '+251 911 891 851',
+    cell2: '+251 912 175 984',
+    cell3: '+251 911 891 888',
+    phone: '+251 911 891 851',
+    tel: '0926803092',
+    email: 'info@mesayabebe.et',
+    region: 'Addis Ababa',
+    zoneSubCity: 'Gulele',
+    woreda: '08',
+    houseNo: '185',
+    addressEn: 'Gulele Sub-city, Woreda 08, House No. 185, Addis Ababa',
+    addressAm: 'ጉለሌ ክፍለ ከተማ ወረዳ 08 ቤት ቁጥር 185 አዲስ አበባ',
+    currency: 'ETB', vatRate: 0.15, validDays: 30,
+    markupPct: 15, contingencyPct: 5, inflationFactor: 1.0,
+    staffPassword: 'mesay2024',
+    disclaimer: 'Rates based on Addis Ababa Design and Construction Works Bureau, 2018 4th Quarter, Direct Cost Only. Actual rates subject to site conditions and current market.',
+    defaultTerms: '50% advance with order, balance on delivery. Prices valid 30 days. Subject to stock and site availability.'
+  },
+  services: [
+    { id: 'sv1', icon: '🏢', titleEn: 'Building Construction', titleAm: 'የህንፃ ግንባታ', descEn: 'Residential, commercial and institutional buildings.' },
+    { id: 'sv2', icon: '🛣️', titleEn: 'Road Works', titleAm: 'የመንገድ ስራ', descEn: 'Urban and rural roads, drainage, culverts, and asphalt.' },
+    { id: 'sv3', icon: '🏗️', titleEn: 'Renovation & Fit-out', titleAm: 'ማሻሻያ እና ማስተካከያ', descEn: 'Interior fit-outs, structural retrofits, and finishing.' },
+    { id: 'sv4', icon: '📦', titleEn: 'General material Supply', titleAm: 'አጠቃላይ አቅርቦት', descEn: 'Construction materials, fixtures, and equipment supply.' }
+  ],
+  projects: [
+    { id: 'p1', title: 'Network Tower and compound fence', type: 'Telecom', icon: '🏢', image: 'img/messe/1.jpg', desc: 'Telecom infrastructure for safaricom.', budget: 'ETB 85,000,000', duration: '24 months', year: 2024, client: 'Safaricom Ethiopia' },
+    { id: 'p2', title: 'solar panel array', type: 'Telecom', icon: '🛣️', image: 'img/messe/2.jpg', desc: 'solar power supply for network tower installation', budget: 'ETB 42,000,000', duration: '14 months', year: 2023, client: 'Safaricom-ethiopia' },
+    { id: 'p3', title: 'Commercial Office Fit-out', type: 'building', icon: '🏢', image: 'img/messe/3.jpg', desc: '1,800 m² office interior fit-out.', budget: 'ETB 28,000,000', duration: '8 months', year: 2023, client: 'Private client' }
+  ],
+  reviews: [
+    { id: 'r1', name: 'Ato Bekele T.', loc: 'Addis Ababa', stars: 5, text: 'Delivered our residential building on schedule. Professional site management.' },
+    { id: 'r2', name: 'Ato Dawit M.', loc: 'Gulele', stars: 5, text: 'Road quality met every spec. Good communication with our engineers.' },
+    { id: 'r3', name: 'W/ro Hana G.', loc: 'Addis Ababa', stars: 5, text: 'Office fit-out finished on time and on budget.' }
+  ],
+  categories: [
+    { id: 'cement', name: 'Cement & Binders', nameAm: 'ሲሚንቶ', icon: '🧱' },
+    { id: 'steel', name: 'Steel & Rebar', nameAm: 'ብረት', icon: '🔩' },
+    { id: 'lumber', name: 'Lumber & Timber', nameAm: 'እንጨት', icon: '🪵' },
+    { id: 'aggregate', name: 'Aggregates', nameAm: 'ጠጠር እና አሸዋ', icon: '⛰️' },
+    { id: 'fixtures', name: 'Fixtures & Pipes', nameAm: 'ቧንቧ እና መለዋወጫ', icon: '🚰' }
+  ],
+  products: [
+    { id: 'sku_cem_425', category: 'cement', name: 'Dangote / Mugher OPC 42.5N', unit: 'quintal (100 kg)', basePrice: 1050, contractorPrice: 1050, stock: 24000, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 1050 }, { min: 20, price: 1020 }, { min: 100, price: 990 } ] },
+    { id: 'sku_cem_325', category: 'cement', name: 'PPC 32.5N Cement', unit: 'quintal (100 kg)', basePrice: 940, contractorPrice: 940, stock: 32000, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 940 }, { min: 20, price: 910 }, { min: 100, price: 880 } ] },
+    { id: 'sku_reb_8',  category: 'steel', name: 'Rebar Ø8 mm — Deformed', unit: 'ton', basePrice: 132000, contractorPrice: 132000, stock: 180, leadTimeDays: 4, taxable: true, tiers: [ { min: 1, price: 132000 }, { min: 5, price: 129500 }, { min: 20, price: 126000 } ] },
+    { id: 'sku_reb_12', category: 'steel', name: 'Rebar Ø12 mm — Deformed', unit: 'ton', basePrice: 130500, contractorPrice: 130500, stock: 240, leadTimeDays: 4, taxable: true, tiers: [ { min: 1, price: 130500 }, { min: 5, price: 128000 }, { min: 20, price: 124500 } ] },
+    { id: 'sku_reb_16', category: 'steel', name: 'Rebar Ø16 mm — Deformed', unit: 'ton', basePrice: 129000, contractorPrice: 129000, stock: 160, leadTimeDays: 4, taxable: true, tiers: [ { min: 1, price: 129000 }, { min: 5, price: 126500 }, { min: 20, price: 123000 } ] },
+    { id: 'sku_lum_pine', category: 'lumber', name: 'Pine Timber 2x4x4m', unit: 'piece', basePrice: 380, contractorPrice: 380, stock: 3200, leadTimeDays: 3, taxable: true, tiers: [ { min: 1, price: 380 }, { min: 50, price: 360 }, { min: 200, price: 340 } ] },
+    { id: 'sku_agg_crushed', category: 'aggregate', name: 'Crushed Stone 20 mm', unit: 'm³', basePrice: 950, contractorPrice: 950, stock: 1800, leadTimeDays: 3, taxable: true, tiers: [ { min: 1, price: 950 }, { min: 10, price: 900 }, { min: 50, price: 850 } ] },
+    { id: 'sku_agg_sand', category: 'aggregate', name: 'Washed River Sand', unit: 'm³', basePrice: 850, contractorPrice: 850, stock: 2200, leadTimeDays: 3, taxable: true, tiers: [ { min: 1, price: 850 }, { min: 10, price: 800 }, { min: 50, price: 750 } ] },
+    { id: 'sku_fix_pvc110', category: 'fixtures', name: 'PVC Pipe Ø110 mm x 6 m', unit: 'piece', basePrice: 1650, contractorPrice: 1650, stock: 900, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 1650 }, { min: 20, price: 1580 }, { min: 100, price: 1500 } ] },
+    { id: 'sku_fix_pvc63', category: 'fixtures', name: 'PVC Pipe Ø63 mm x 6 m', unit: 'piece', basePrice: 780, contractorPrice: 780, stock: 1400, leadTimeDays: 2, taxable: true, tiers: [ { min: 1, price: 780 }, { min: 20, price: 740 }, { min: 100, price: 700 } ] }
+  ],
+  freight: { zones: [ { id: 'addis', name: 'Addis Ababa', flat: 800, perTon: 40 }, { id: 'nearby', name: 'Within 100 km', flat: 1800, perTon: 75 }, { id: 'regional', name: 'Regional (100-400)', flat: 4500, perTon: 140 }, { id: 'far', name: 'Remote (> 400 km)', flat: 9000, perTon: 220 } ] },
+  hero: { badge1En: 'General Contractor G5', badge1Am: 'አጠቃላይ ተቋራጭ 511114', badge2En: 'Trusted', badge2Am: 'ma', badge3En: '10+ Years', badge3Am: '18+ ዓመታት' },
+  stats: [ { id: 's1', num: '120+', lblEn: 'Projects Delivered', lblAm: 'የተጠናቀቁ ፕሮጀክቶች' }, { id: 's2', num: '18+',  lblEn: 'Years in Business',  lblAm: 'የንግድ ዓመታት' }, { id: 's3', num: '511114', lblEn: 'License Code',     lblAm: 'የፈቃድ ኮድ' }, { id: 's4', num: '100%', lblEn: 'VAT Registered',     lblAm: 'ተ.እ.ታ ተመዝጋቢ' } ]
+};
+
+let _state = DEFAULT_DATA;
+const subs = new Set();
+
+// Sync state to components
+export function getData() { return _state; }
+export function subscribe(fn) { subs.add(fn); return () => subs.delete(fn); }
+export function setData(next) {
+  _state = next;
+  // Save "business" to IndexedDB
+  if (next.business) saveBusinessInfo(next.business).catch(e => console.warn('Save business failed', e));
+  subs.forEach(fn => fn(next));
+}
+export function resetData() { setData(DEFAULT_DATA); }
+
+export function useStore() {
+  const [d, setD] = useState(_state);
+  
+  useEffect(() => {
+    let alive = true;
+    
+    // Load from IndexedDB (with migration from localStorage if needed)
+    (async () => {
+      try {
+        const idbBiz = await getBusinessInfo();
+        if (idbBiz) {
+          _state = { ..._state, business: idbBiz };
+          if (alive) setD(_state);
+        } else {
+          // Migration: load from localStorage once
+          const raw = localStorage.getItem(KEY);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed.business) {
+              await saveBusinessInfo(parsed.business);
+              _state = { ..._state, business: parsed.business };
+              if (alive) setD(_state);
+              console.log('Migrated business to IndexedDB');
+            }
+          }
+        }
+      } catch (e) { console.warn('DB load error:', e); }
+    })();
+    
+    return subscribe(d => { if (alive) setD(d); });
+  }, []);
+  
+  return [d, setData];
+}
+
+export function uid() { return 'id_' + Math.random().toString(36).slice(2, 9); }

@@ -1,0 +1,197 @@
+import { putAll, getAll, clearStore, put, getAllBy } from './db.js';
+import { RATEBOOK } from './ratebook-data.js';
+
+function normalizeItem(catId, item, idx) {
+  const rawPrice = String(item.price || '').replace(/,/g, '').trim();
+  const price = rawPrice === '' || rawPrice === '—' ? null : parseFloat(rawPrice);
+  return {
+    id: catId + ':' + (item.code || idx) + ':' + idx,
+    categoryId: catId,
+    code: item.code || '',
+    description: item.description || '',
+    descriptionAm: item.descriptionAm || '',
+    tenderAliases: item.tenderAliases || [],
+    unit: item.unit || '',
+    basePrice: price,
+    contractorPrice: price,
+    page: item.page || 0
+  };
+}
+
+export async function importRateBook(json) {
+  const src = json || RATEBOOK;
+  if (!src || !Array.isArray(src.categories)) throw new Error('Invalid rate book data — missing "categories"');
+  const categories = [];
+  const items = [];
+  src.categories.forEach(cat => {
+    const catId = String(cat.id);
+    categories.push({
+      id: catId,
+      title: cat.title || 'Untitled',
+      titleAm: cat.titleAm || cat.title || 'Untitled',
+      itemCount: (cat.items || []).length
+    });
+    (cat.items || []).forEach((item, idx) => items.push(normalizeItem(catId, item, idx)));
+  });
+  await clearStore('ratebook_categories');
+  await clearStore('ratebook_items');
+  await putAll('ratebook_categories', categories);
+  await putAll('ratebook_items', items);
+  await put('meta', {
+    key: 'ratebook_source',
+    source: src.source || '',
+    document: src.document || '',
+    quarter: src.quarter || '',
+    currency: src.currency || 'ETB',
+    importedAt: new Date().toISOString(),
+    categoryCount: categories.length,
+    itemCount: items.length
+  });
+  return { categoryCount: categories.length, itemCount: items.length };
+}
+
+export async function seedFromModule() { return importRateBook(RATEBOOK); }
+
+export async function getRateBookMeta() {
+  const rows = await getAll('meta');
+  return rows.find(r => r.key === 'ratebook_source') || null;
+}
+export async function getRateCategories() { return getAll('ratebook_categories'); }
+export async function getRateItemsByCategory(catId) { return getAllBy('ratebook_items', 'by-category', catId); }
+export async function getRateItems() { return getAll('ratebook_items'); }
+
+export async function updateRateItem(id, patch) {
+  const rows = await getAll('ratebook_items');
+  const item = rows.find(r => r.id === id);
+  if (!item) return null;
+  const next = Object.assign({}, item, patch);
+  await put('ratebook_items', next);
+  return next;
+}
+
+export async function applyInflation(factor, alsoContractor = false) {
+  const rows = await getAll('ratebook_items');
+  const updated = rows.map(r => {
+    if (r.basePrice == null) return r;
+    const next = Object.assign({}, r, { basePrice: Math.round(r.basePrice * factor * 100) / 100 });
+    if (alsoContractor) next.contractorPrice = next.basePrice;
+    return next;
+  });
+  await putAll('ratebook_items', updated);
+  return updated.length;
+}
+
+export async function resetContractorPrices() {
+  const rows = await getAll('ratebook_items');
+  const updated = rows.map(r => Object.assign({}, r, { contractorPrice: r.basePrice }));
+  await putAll('ratebook_items', updated);
+  return updated.length;
+}
+
+export async function clearRateBook() {
+  await clearStore('ratebook_categories');
+  await clearStore('ratebook_items');
+  await clearStore('meta');
+}
+
+/**
+ * Migration: backfill `descriptionAm`, `titleAm`, and `tenderAliases` on any
+ * records that predate the current schema. Safe to call on every boot.
+ */
+export async function migrateRateBook() {
+  const items = await getAll('ratebook_items');
+  const itemsToFix = items.filter(i =>
+    i.descriptionAm === undefined ||
+    i.tenderAliases === undefined
+  );
+  if (itemsToFix.length > 0) {
+    await putAll('ratebook_items', itemsToFix.map(i => ({
+      ...i,
+      descriptionAm: i.descriptionAm ?? '',
+      tenderAliases: i.tenderAliases ?? []
+    })));
+  }
+  const cats = await getAll('ratebook_categories');
+  const catsToFix = cats.filter(c => c.titleAm === undefined);
+  if (catsToFix.length > 0) {
+    await putAll('ratebook_categories', catsToFix.map(c => ({ ...c, titleAm: c.title })));
+  }
+  return { itemsFixed: itemsToFix.length, categoriesFixed: catsToFix.length };
+}
+
+/**
+ * Append a tender description to a rate-book item's alias list.
+ * Dedupes case-insensitively, trims, and skips empty or too-short strings.
+ */
+export async function addTenderAlias(rateItemId, tenderDescription) {
+  const alias = String(tenderDescription || '').trim().replace(/\s+/g, ' ');
+  if (alias.length < 3) return null;
+  const rows = await getAll('ratebook_items');
+  const item = rows.find(r => r.id === rateItemId);
+  if (!item) return null;
+  const existing = item.tenderAliases || [];
+  const lower = alias.toLowerCase();
+  if (existing.some(a => a.toLowerCase() === lower)) return item;
+  const next = { ...item, tenderAliases: [...existing, alias] };
+  await put('ratebook_items', next);
+  return next;
+}
+
+/**
+ * Remove an alias by exact string match.
+ */
+export async function removeTenderAlias(rateItemId, alias) {
+  const rows = await getAll('ratebook_items');
+  const item = rows.find(r => r.id === rateItemId);
+  if (!item) return null;
+  const next = { ...item, tenderAliases: (item.tenderAliases || []).filter(a => a !== alias) };
+  await put('ratebook_items', next);
+  return next;
+}
+
+/**
+ * Create a brand-new rate-book item (case 2 — item genuinely not in the book).
+ * Fills required fields; puts it in a synthetic category if none is given.
+ */
+export async function createRateItem({ description, descriptionAm = '', unit, rate, categoryId = 'custom' }) {
+  const clean = String(description || '').trim().replace(/\s+/g, ' ');
+  if (!clean) throw new Error('Description required');
+  const items = await getAll('ratebook_items');
+  const id = 'custom:' + Date.now().toString(36) + ':' + Math.random().toString(36).slice(2, 6);
+  const next = {
+    id,
+    categoryId,
+    code: '',
+    description: clean,
+    descriptionAm: String(descriptionAm || '').trim(),
+    tenderAliases: [clean],
+    unit: String(unit || ''),
+    basePrice: Number(rate) || 0,
+    contractorPrice: Number(rate) || 0,
+    page: 0
+  };
+  await put('ratebook_items', next);
+
+  // Ensure 'custom' category exists so the item is visible in Rate Book tab
+  const cats = await getAll('ratebook_categories');
+  if (!cats.some(c => c.id === 'custom')) {
+    await put('ratebook_categories', {
+      id: 'custom',
+      title: 'Custom items (added from tenders)',
+      titleAm: 'ብጁ ዕቃዎች (ከጨረታ የተጨመሩ)',
+      itemCount: 0
+    });
+  }
+
+  // Refresh itemCount on the custom category
+  const freshItems = await getAll('ratebook_items');
+  const customCount = freshItems.filter(i => i.categoryId === 'custom').length;
+  await put('ratebook_categories', {
+    id: 'custom',
+    title: 'Custom items (added from tenders)',
+    titleAm: 'ብጁ ዕቃዎች (ከጨረታ የተጨመሩ)',
+    itemCount: customCount
+  });
+
+  return next;
+}

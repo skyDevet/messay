@@ -1,0 +1,244 @@
+import { useState, useEffect, useMemo } from 'preact/hooks';
+import {
+  egpStatus, egpLogin, fetchTenders, normalizeTenderList, normalizeItems,
+  fetchTenderDetail, fetchQuotationItems, fetchQuotationResponse,
+  egpRegister, egpAddItems,
+} from '../data/egp.js';
+import {
+  saveTenders, getTenders, deleteTender,
+  saveTenderDetail, getTenderDetail,
+  saveTenderItems,
+} from '../data/tenders.js';
+
+export function TendersTab({ onCreateProforma }) {
+  const [status, setStatus]   = useState({ isAuthenticated: false, loading: true });
+  const [rows, setRows]       = useState([]);
+  const [search, setSearch]   = useState('Construction');
+  const [top, setTop]         = useState(15);
+  const [busy, setBusy]       = useState(false);
+  const [msg, setMsg]         = useState('');
+  const [error, setError]     = useState('');
+  const [filter, setFilter]   = useState('');
+  const [detail, setDetail]   = useState(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+
+  const loadStored = async () => {
+    try {
+      const all = await getTenders();
+      setRows(all.sort((a,b)=>String(b.invitationDate).localeCompare(String(a.invitationDate))));
+    } catch (e) { setError('DB read failed: ' + e.message); }
+  };
+
+  const refreshStatus = async () => {
+    try {
+      const s = await egpStatus();
+      setStatus({ ...s, loading: false });
+    } catch (e) {
+      setStatus({ isAuthenticated: false, loading: false, error: e.message });
+      setError('Cannot reach /api/egp/status: ' + e.message);
+    }
+  };
+
+  useEffect(() => {
+    refreshStatus();
+    loadStored();
+    const t = setInterval(refreshStatus, 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const login = async () => {
+    setBusy(true); setError('');
+    try {
+      const r = await egpLogin();
+      if (!r.success) setError('Login failed: ' + JSON.stringify(r));
+      await refreshStatus();
+    } catch (e) { setError('Login request failed: ' + e.message); }
+    setBusy(false);
+  };
+
+  const doFetch = async () => {
+    setBusy(true); setMsg(''); setError('');
+    try {
+      const raw = await fetchTenders({ search, top });
+      const norm = normalizeTenderList(raw);
+      await saveTenders(norm);
+      await loadStored();
+      setMsg(`Fetched ${raw.total ?? '?'} total · ${norm.length} normalized · saved.`);
+    } catch (e) { setError('Fetch failed: ' + e.message); }
+    setBusy(false);
+  };
+
+  const openTender = async (t) => {
+    setLoadingDetail(true); setError('');
+    try {
+      const cached = await getTenderDetail(t.id);
+      if (cached) {
+        setDetail({ tender: t, detail: cached.detail, items: cached.items, response: cached.response });
+        setLoadingDetail(false); return;
+      }
+      const d = await fetchTenderDetail(t);
+      let items = [], response = null;
+      const qrid = d.quotationRequestId || d.quatationRequestId || null;
+      if (t.sourceApplication === 'Purchasing' && qrid) {
+        try { items = normalizeItems(await fetchQuotationItems(qrid)); } catch (e) { console.warn(e); }
+        try { response = await fetchQuotationResponse(qrid); } catch {}
+      }
+      await saveTenderDetail({ lotId: t.id, quotationRequestId: qrid, detail: d, items, response, fetchedAt: Date.now() });
+      if (qrid) await saveTenderItems({ key: qrid, lotId: t.id, items, response, fetchedAt: Date.now() });
+      setDetail({ tender: t, detail: d, items, response });
+    } catch (e) { setError('Detail failed: ' + e.message); }
+    setLoadingDetail(false);
+  };
+
+  const removeTender = async (id) => {
+    if (!confirm('Remove this tender from your list?')) return;
+    try { await deleteTender(id); loadStored(); } catch (e) { setError(e.message); }
+  };
+
+  const filtered = useMemo(() => {
+    const s = filter.trim().toLowerCase();
+    if (!s) return rows;
+    return rows.filter(t =>
+      (t.lotName || '').toLowerCase().includes(s) ||
+      (t.procuringEntity || '').toLowerCase().includes(s) ||
+      (t.procurementReferenceNo || '').toLowerCase().includes(s)
+    );
+  }, [rows, filter]);
+
+  return (
+    <div class="admin-panel">
+      <div class="admin-panel-head">
+        <h2>Tenders ({rows.length})</h2>
+        <div class="pf-actions" style="margin:0;">
+          {status.loading
+            ? <span class="pf-status draft">Checking session...</span>
+            : status.isAuthenticated
+              ? <span class="pf-status accepted">{status.name || 'Signed in'} · {Math.round((status.expiresInSeconds||0)/60)}m left</span>
+              : <button class="btn-add" disabled={busy} onClick={login}>{busy ? 'Logging in...' : 'Login to eGP'}</button>}
+        </div>
+      </div>
+
+      {error && <div class="staff-err" style="margin-bottom:12px;">{error}</div>}
+
+      <div class="admin-card">
+        <div class="admin-grid3">
+          <div class="admin-field"><label>Search keyword</label>
+            <input value={search} onInput={e=>setSearch(e.target.value)} /></div>
+          <div class="admin-field"><label>Fetch top N</label>
+            <input type="number" value={top} onInput={e=>setTop(+e.target.value||15)} /></div>
+          <div class="admin-field"><label>&nbsp;</label>
+            <button class="btn-add" disabled={busy || !status.isAuthenticated} onClick={doFetch}>
+              {busy ? 'Fetching...' : 'Fetch from eGP'}
+            </button>
+          </div>
+        </div>
+        {msg && <div class="admin-msg">{msg}</div>}
+      </div>
+
+      <div class="admin-field" style="margin-bottom:12px;">
+        <input placeholder="Filter stored tenders..." value={filter} onInput={e=>setFilter(e.target.value)} />
+      </div>
+
+      {filtered.length === 0 && <div class="admin-card">No tenders yet. Log in, then click <strong>Fetch from eGP</strong>.</div>}
+
+      {filtered.map(t => (
+        <div class="admin-card" key={t.id}>
+          <div class="admin-card-head">
+            <strong style="flex:1;min-width:200px;">{t.lotName}</strong>
+            <span class="pf-status draft">{t.procurementCategory || t.sourceApplication}</span>
+          </div>
+          <div style="font-size:0.84rem;color:var(--gray);">
+            {t.procuringEntity} · Ref {t.procurementReferenceNo}
+            {t.submissionDeadline && ` · Deadline ${String(t.submissionDeadline).slice(0,10)}`}
+          </div>
+          <div class="pf-actions">
+            <button class="btn btn-back" onClick={() => openTender(t)}>
+              {loadingDetail ? '...' : 'View detail'}
+            </button>
+            <button class="btn-del" onClick={() => removeTender(t.id)}>Remove</button>
+          </div>
+        </div>
+      ))}
+
+      {detail && (
+        <TenderDetailModal
+          data={detail}
+          onClose={() => setDetail(null)}
+          onCreateProforma={(payload) => { setDetail(null); onCreateProforma(payload); }}
+        />
+      )}
+    </div>
+  );
+}
+
+function TenderDetailModal({ data, onClose, onCreateProforma }) {
+  const { tender, detail, items, response } = data;
+  const li = detail.lotInformation || {};
+  const addr = li.address || {};
+  const qrid = detail.quotationRequestId || detail.quatationRequestId || tender.id;
+
+  const [working, setWorking] = useState(false);
+  const [localResponse, setLocalResponse] = useState(response);
+  const [msg, setMsg] = useState('');
+
+  const doRegister = async () => {
+    setWorking(true); setMsg('');
+    const r = await egpRegister(qrid, li.name || tender.lotName);
+    if (r.ok) {
+      setMsg('Registered');
+      try { setLocalResponse(await fetchQuotationResponse(qrid)); } catch {}
+    } else setMsg('Register failed: ' + (r.data?.error || r.status));
+    setWorking(false);
+  };
+
+  return (
+    <div class="modal-overlay" onClick={onClose}>
+      <div class="modal" style="max-width:820px;" onClick={e=>e.stopPropagation()}>
+        <button class="modal-close" onClick={onClose}>X</button>
+        <h2>{li.name || tender.lotName}</h2>
+        <p style="color:var(--gray);font-size:0.88rem;">{li.description}</p>
+        <div class="modal-meta">
+          <span><strong>Entity:</strong> {li.procuring_entity || tender.procuringEntity}</span>
+          <span><strong>Ref:</strong> {li.reference_no || tender.procurementReferenceNo}</span>
+          <span><strong>Deadline:</strong> {li.submission_deadline || tender.submissionDeadline}</span>
+          <span><strong>Town:</strong> {addr.town || '-'}</span>
+        </div>
+
+        <h3 style="margin-top:14px;">Items ({items.length})</h3>
+        {items.length === 0 && <p style="color:var(--gray);font-size:0.85rem;">No items returned for this tender.</p>}
+        {items.length > 0 && (
+          <table class="pf-table">
+            <thead><tr><th>#</th><th>Description</th><th>Unit</th><th>Qty</th></tr></thead>
+            <tbody>
+              {items.map((it, i) => (
+                <tr key={it.lotItemId || i}>
+                  <td>{i+1}</td><td>{it.description}</td><td>{it.unit}</td><td>{it.qty}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+
+        {localResponse && (
+          <div class="admin-msg" style="margin-top:12px;">
+            Response status: <strong>{localResponse.status}</strong>
+          </div>
+        )}
+        {msg && <div class="admin-msg" style="margin-top:8px;">{msg}</div>}
+
+        <div class="pf-actions" style="margin-top:14px;">
+          <button class="btn btn-primary" disabled={items.length===0}
+            onClick={() => onCreateProforma({ tender, detail: li, items })}>
+            Create Proforma from this tender
+          </button>
+          {!localResponse && tender.sourceApplication === 'Purchasing' && (
+            <button class="btn-add" disabled={working} onClick={doRegister}>
+              {working ? 'Registering...' : 'Register on eGP'}
+            </button>
+          )}
+          <button class="btn btn-back" onClick={onClose}>Close</button>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,126 @@
+import { useState, useEffect } from 'preact/hooks';
+import { Nav } from './components/Nav.jsx';
+import { Hero } from './components/Hero.jsx';
+import { TrustStats } from './components/TrustStats.jsx';
+import { Services } from './components/Services.jsx';
+import { Projects } from './components/Projects.jsx';
+import { Catalog } from './components/Catalog.jsx';
+import { RequestMaterials } from './components/RequestMaterials.jsx';
+import { RequestServices } from './components/RequestServices.jsx';
+import { Reviews } from './components/Reviews.jsx';
+import { ProjectModal } from './components/ProjectModal.jsx';
+import { Footer } from './components/Footer.jsx';
+import { StaffLogin } from './admin/StaffLogin.jsx';
+import { Admin } from './admin/Admin.jsx';
+import { getRateBookMeta, seedFromModule } from './data/ratebook.js';
+import { LoginModal } from './components/LoginModal.jsx';
+import { useAuth } from './lib/auth.js';
+import { supabase } from './lib/supabase.js';
+import { isAdminUser } from './lib/auth.js';
+
+export function App() {
+  const [activeProject, setActiveProject] = useState(null);
+  const [staff, setStaff] = useState(sessionStorage.getItem('mesay_staff') === '1');
+  const [loginOpen, setLoginOpen] = useState(false);
+  const [cart, setCart] = useState([]);
+  const [openForm, setOpenForm] = useState(null); // 'materials' | 'services' | null
+  const { user } = useAuth();
+  const [pendingForm, setPendingForm] = useState(null); // quote form waiting for Google sign-in
+
+  // Gate: any quote form needs a signed-in user; otherwise show the login modal first
+  const requestForm = (kind) => {
+    if (user) { setOpenForm(kind); return; }
+    setPendingForm(kind);
+  };
+
+  // Back from Google sign-in: reopen the form the user asked for (and restore the cart)
+  useEffect(() => {
+    if (!user) return;
+    const kind = sessionStorage.getItem('mesay_pending_form');
+    if (!kind) return;
+    sessionStorage.removeItem('mesay_pending_form');
+    try {
+      const saved = JSON.parse(sessionStorage.getItem('mesay_pending_cart') || 'null');
+      if (saved && saved.length) setCart(saved);
+    } catch (e) {}
+    sessionStorage.removeItem('mesay_pending_cart');
+    setPendingForm(null);
+    setOpenForm(kind);
+  }, [user]);
+
+  // Back from admin Google sign-in: reopen the staff login so it can run the admin_users check
+  useEffect(() => {
+    if (sessionStorage.getItem('mesay_admin_oauth') === '1') setLoginOpen(true);
+  }, []);
+  
+useEffect(() => {
+  (async () => {
+    try {
+      const { migrateRateBook } = await import('./data/ratebook.js');
+      const mig = await migrateRateBook();
+      if (mig.itemsFixed || mig.categoriesFixed) {
+        console.log('Rate book migration:', mig);
+      }
+      const meta = await getRateBookMeta();
+      if (!meta) {
+        const res = await seedFromModule();
+        console.log('Rate book auto-seeded:', res);
+      }
+    } catch (e) { console.error('Auto-seed failed:', e); }
+  })();
+}, []);
+  
+  // When the user picks a form, scroll to it once it renders
+  useEffect(() => {
+    if (openForm) {
+      requestAnimationFrame(() => {
+        const id = openForm === 'materials' ? 'request-materials' : 'request-services';
+        const el = document.getElementById(id);
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      });
+    }
+  }, [openForm]);
+
+  if (staff) return <Admin onExit={() => setStaff(false)} />;
+  if (loginOpen) return <StaffLogin onSuccess={() => { setLoginOpen(false); setStaff(true); }} onExit={() => setLoginOpen(false)} />;
+
+  // Full-screen solo view: while a quote form is open, nothing else on the home page renders
+  if (openForm === 'materials') return (
+    <div class="solo-form">
+      <RequestMaterials cart={cart} setCart={setCart} user={user} onClose={() => setOpenForm(null)} />
+    </div>
+  );
+  if (openForm === 'services') return (
+    <div class="solo-form">
+      <RequestServices user={user} onClose={() => setOpenForm(null)} />
+    </div>
+  );
+const handleStaffClick = async () => {
+  try {
+    if (!supabase) { setLoginOpen(true); return; }
+    const { data: s } = await supabase.auth.getSession();
+    const u = s.session && s.session.user;
+    if (u && (await isAdminUser(u.id))) {
+      sessionStorage.setItem('mesay_staff', '1');
+      setStaff(true);
+      return;
+    }
+  } catch (e) {}
+  setLoginOpen(true);
+};
+  return (
+    <>
+      <Nav onStaff={handleStaffClick} onRequestQuote={() => requestForm('materials')} />
+      <Hero onOpenForm={requestForm} />
+      <TrustStats />
+      <Services />
+      <Projects onOpen={setActiveProject} />
+      <Catalog cart={cart} setCart={setCart} onRequest={() => requestForm('materials')} />
+
+      <Reviews />
+      <Footer />
+      {activeProject && <ProjectModal project={activeProject} onClose={() => setActiveProject(null)} onRequest={requestForm} />}
+      {pendingForm && <LoginModal formKind={pendingForm} cart={cart} onClose={() => setPendingForm(null)} />}
+    </>
+  );
+}
